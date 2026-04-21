@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-GLKB Agent — a biomedical Q&A system using Google ADK that queries the GLKB Neo4j knowledge graph (263M+ biomedical terms, 14.6M+ relationships) and retrieves PubMed literature to produce grounded, cited answers. Uses OpenAI GPT-4o via LiteLlm with ADK SkillToolset for on-demand instruction loading. Internal to University of Michigan Medical School.
+GLKB Agent — a biomedical Q&A system using Google ADK that queries the GLKB Neo4j knowledge graph (263M+ biomedical terms, 14.6M+ relationships) and retrieves PubMed literature to produce grounded, cited answers. Uses OpenAI GPT-5.2 via LiteLlm with ADK SkillToolset for on-demand instruction loading. Internal to University of Michigan Medical School.
 
 ## Commands
 
@@ -35,9 +35,10 @@ pip install 'google-adk>=1.25.0' python-dotenv neo4j httpx litellm loguru pyyaml
 pip install -r service/requirements.txt
 ```
 
-### Evaluate (no eval sets exist yet)
+### Run tests
 ```bash
-adk eval my_agent path/to/eval_set.json
+# Verify ADK session rewind mechanics (uses gpt-4o-mini, requires .env)
+python test_rewind.py
 ```
 
 ## Architecture
@@ -47,9 +48,10 @@ adk eval my_agent path/to/eval_set.json
 The root agent (`GLKBAgent`) is a single `LlmAgent` defined in `my_agent/agent.py`:
 
 ```
-GLKBAgent (gpt-4o, single LLM session)
+GLKBAgent (gpt-5.2, single LLM session)
   ├── Tools (always registered):
-  │     KG:     get_database_schema, execute_cypher, vocabulary_search, article_search
+  │     KG:     get_database_schema, execute_cypher, vocabulary_search,
+  │             article_search, cite_evidence
   │     PubMed: search_pubmed, fetch_abstract, get_fulltext,
   │             find_similar_articles, get_citing_articles, comprehensive_report
   ├── SkillToolset (on-demand instruction loading):
@@ -73,22 +75,39 @@ Skills use ADK's experimental `SkillToolset` for incremental context loading:
 - `my_agent/skills/glkb_knowledge_graph/` — Cypher generation workflow, GLKB schema reference, common query patterns
 - `my_agent/skills/pubmed_reader/` — Article retrieval strategy, tool selection guidance, PubMed API documentation
 
-Skills are constructed programmatically via `load_skill_from_directory()` helper in `agent.py` (ADK's `load_skill_from_dir` does not exist in 1.25.1).
+Skills are constructed programmatically via `load_skill_from_directory()` in `agent.py` (ADK's `load_skill_from_dir` does not exist in 1.25.1).
 
 ### Key Design Patterns
 
 - **Single agent with skills**: One `LlmAgent` handles routing, evidence gathering, and answer synthesis. Detailed workflow instructions are loaded on-demand via SkillToolset.
 - **Tool functions are async**, decorated with `@log_tool_call`, and wrapped with `FunctionTool()`.
-- **execute_cypher blocks write operations** (CREATE/DELETE/SET/REMOVE/MERGE/DROP).
-- Memory tools (`my_agent/memory.py`, Mem0+Qdrant) are defined but inactive.
+- **execute_cypher blocks write operations** (CREATE/DELETE/SET/REMOVE/MERGE/DROP) with a 30s timeout and 500-row cap.
+- Memory tools (`my_agent/memory.py`, Mem0+Qdrant) are defined but inactive — not exported in `agent.py`.
 
 ### Service Layer (`service/`)
 
-- `api.py` — FastAPI app with two API styles: (1) RESTful session-scoped endpoints under `/apps/{app}/users/{user}/sessions/...` and (2) a simplified `POST /stream` SSE endpoint compatible with the existing GLKB backend.
+- `api.py` — FastAPI app with two API styles:
+  1. RESTful session-scoped endpoints (ADK-compatible):
+     - `GET /health`
+     - `POST /apps/{app}/users/{user}/sessions` — create session
+     - `GET /apps/{app}/users/{user}/sessions` — list sessions
+     - `GET /apps/{app}/users/{user}/sessions/{session}` — get session
+     - `DELETE /apps/{app}/users/{user}/sessions/{session}` — delete session
+     - `POST /apps/{app}/users/{user}/sessions/{session}/chat` — non-streaming chat
+     - `POST /apps/{app}/users/{user}/sessions/{session}/chat/stream` — SSE streaming chat
+     - `GET /apps/{app}/users/{user}/sessions/{session}/messages` — message history
+     - `POST /apps/{app}/users/{user}/sessions/{session}/rewind` — undo invocations
+  2. Legacy `POST /stream` SSE endpoint compatible with the existing GLKB backend; includes trajectory builder, evidence enforcement, and PMID extraction.
 - `runner.py` — `AgentRunner` bridges SQLite persistence with ADK's `InMemorySessionService`. Reconstructs ADK sessions from stored messages on each request, then syncs state back.
-- `session_service.py` — Async SQLite session store (`aiosqlite`) with `sessions` and `messages` tables.
+- `session_service.py` — Async SQLite session store (`aiosqlite`) with `sessions` and `messages` tables (singleton via `get_session_service()`).
 - `models.py` — Pydantic v2 request/response models.
 - The `/stream` endpoint optionally integrates with `reorg_glkb_backend` (separate project) for article metadata enrichment.
+- SSE keepalive comments are sent every 15s to prevent proxy timeouts on long agent runs.
+- Transcript logging: all `/stream` interactions are appended to `transcript.log` in JSONL format.
+
+### Rewind
+
+The rewind endpoint (`POST /apps/{app}/users/{user}/sessions/{session}/rewind`) removes an invocation (and all subsequent ones) from both SQLite and the reconstructed ADK session. This supports "edit message" / "regenerate" UX: rewind to before a turn, then re-submit.
 
 ### GLKB Knowledge Graph Schema
 
@@ -106,16 +125,16 @@ Full-text indexes: `vocabulary_Names` (on Vocabulary.name), `article_Title` (on 
 
 Integrated from [pubmed-reader-cskill](https://github.com/yuanhao96/pubmed-reader-cskill). Provides direct NCBI E-utilities access via synchronous functions wrapped with `asyncio.to_thread()` in `tools.py`.
 
-| Tool | Function | Purpose |
-|------|----------|---------|
-| `search_pubmed_tool` | `search_pubmed()` | Direct NCBI ESearch with date/author/journal filters |
-| `fetch_abstract_tool` | `fetch_abstract()` | Abstract + metadata + MeSH terms for a PMID |
-| `get_fulltext_tool` | `get_fulltext()` | Full-text sections from PMC Open Access (~3M articles) |
-| `find_similar_articles_tool` | `find_similar_articles()` | Related papers via NCBI ELink similarity |
-| `get_citing_articles_tool` | `get_citing_articles()` | Papers that cite a given PMID |
-| `comprehensive_report_tool` | `comprehensive_article_report()` | Full analysis: metadata + citations + full text |
+| Tool | Purpose |
+|------|---------|
+| `search_pubmed` | Direct NCBI ESearch with date/author/journal filters |
+| `fetch_abstract` | Abstract + metadata + MeSH terms for a PMID |
+| `get_fulltext` | Full-text sections from PMC Open Access (~3M articles) |
+| `find_similar_articles` | Related papers via NCBI ELink similarity |
+| `get_citing_articles` | Papers that cite a given PMID |
+| `comprehensive_report` | Full analysis: metadata + citations + full text |
 
-The skill includes caching (`scripts/utils/cache_manager.py`) and adaptive rate limiting (`scripts/utils/rate_limiter.py`). Rate limits: 3 req/s without API key, 10 req/s with `NCBI_API_KEY`.
+The skill includes caching (`my_agent/scripts/pubmed_reader/utils/cache_manager.py`) and adaptive rate limiting (`rate_limiter.py`). Rate limits: 3 req/s without API key, 10 req/s with `NCBI_API_KEY`.
 
 ## Environment Variables
 
@@ -127,20 +146,16 @@ Stored in `my_agent/.env`:
 | `NEO4J_USER` | Yes | Neo4j username |
 | `NEO4J_PASSWORD` | Yes | Neo4j password |
 | `NEO4J_DATABASE` | Yes | Neo4j database name |
-| `OPENAI_API_KEY` | Yes | OpenAI API key for GPT-4o/4o-mini |
+| `OPENAI_API_KEY` | Yes | OpenAI API key |
 | `AGENTS_LOG_DIR` | No | Custom log directory path |
 | `NCBI_API_KEY` | No | NCBI API key for 10 req/s PubMed rate limit (3 req/s without) |
 | `NCBI_EMAIL` | No | Contact email for NCBI E-utilities (recommended for production) |
-
-## Models
-
-Configured in `my_agent/agent.py`:
-- `LLM_MODEL = LiteLlm(model="openai/gpt-4o")` — single agent (GLKBAgent)
 
 ## Conventions
 
 - Python 3.11+ required.
 - All tool functions must be `async`, use `@log_tool_call` decorator, and be exported as `FunctionTool()` instances.
-- No tests or eval sets exist yet. No Dockerfile or CI/CD.
+- No eval sets exist yet. No Dockerfile or CI/CD.
 - ADK SkillToolset is experimental (`@experimental`). Requires `google-adk>=1.25.0`.
+- Named loggers use `propagate=False` to prevent 3rd-party library log hijacking.
 - Neo4j MCP toolset (`/opt/neo4j/neo4j-mcp/neo4j-mcp`) exists as an alternative to direct bolt tools but is not used in the active pipeline.
