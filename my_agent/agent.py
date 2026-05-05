@@ -53,6 +53,7 @@ logger = logging.getLogger(__name__)
 # Tools (from tools.py)
 # -----------------------------------------
 from tools import glkb_tools, pubmed_tools
+from memory import MemoryToolset, _memory_after_agent_callback
 
 # -----------------------------------------
 # Model
@@ -131,6 +132,11 @@ IMPORTANT:
 - If information is insufficient after querying, acknowledge limitations.
 - Kindly refuse to answer questions that are not related to biomedical research, the GLKB database, or the GLKB agent system.
 
+MEMORY WORKFLOW:
+- At the start of each session, call query_memory to surface relevant prior context.
+- Conversation turns are saved to memory automatically — do not attempt to save them manually.
+- Call save_memory when the user ends the session or explicitly asks to save.
+
 EVIDENCE AND CITATION WORKFLOW:
 1. After gathering evidence from tools, identify the specific sentences or passages
    that directly support your answer.
@@ -165,5 +171,7 @@ root_agent = LlmAgent(
         *glkb_tools,
         *pubmed_tools,
         SkillToolset(skills=[kg_skill, lit_skill]),
+        MemoryToolset(),
     ],
+    after_agent_callback=_memory_after_agent_callback,
 )

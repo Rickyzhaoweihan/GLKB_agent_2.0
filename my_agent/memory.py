@@ -1,463 +1,212 @@
 """
-Memory Tools for GLKB Agent System
+LayerMem integration for the GLKB agent.
 
-Provides persistent memory capabilities using Mem0 for:
-- Storing conversation context and user preferences
-- Retrieving relevant past interactions
-- Managing memory lifecycle (add, search, delete)
+Exposes MemoryToolset and _memory_after_agent_callback for wiring into agent.py.
+All settings are read from config.yaml via cfg.
 """
 
-import logging
+import sys
 import os
-from typing import Optional, List
-from dotenv import load_dotenv
+import asyncio
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+
+from google.adk.agents.readonly_context import ReadonlyContext
+from google.adk.tools.base_toolset import BaseToolset
 from google.adk.tools import FunctionTool
 
-load_dotenv()
+from config import cfg
 
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------
-# Memory Configuration and Initialization
+# LayerMem setup
 # -----------------------------------------
 
-# Ensure the memory directory exists before initializing Mem0
-MEMORY_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "memory", ".mem0")
-os.makedirs(MEMORY_DIR, exist_ok=True)
-logger.info(f"Memory directory ensured at: {MEMORY_DIR}")
+MEMORY_DB_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", cfg.paths.layermem_db)
+)
+_LAYERMEM_ENABLED = cfg.memory.enabled
+CONSOLIDATE_EVERY_N_FLUSHES = cfg.memory.consolidate_every_n_flushes
+AGENT_TEXT_LIMIT = cfg.memory.agent_text_limit
 
-# Mem0 configuration
-config = {
-    # Override where the history database file lives
-    "history_db_path": os.path.join(MEMORY_DIR, "history.db"),
+mem = None
+_session_id = f"session_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H-%M-%S')}"
+_flush_count: int = 0
 
-    # Configure vector store for persistent storage (not /tmp)
-    "vector_store": {
-        "provider": "qdrant",
-        "config": {
-            "collection_name": "glkb_agent_memory",
-            "path": os.path.join(MEMORY_DIR, "qdrant"),  # Persistent path
-            "on_disk": True,  # Enable disk persistence
-        }
-    },
+if _LAYERMEM_ENABLED:
+    _LAYERMEM_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "layerwise_memory"))
+    sys.path.insert(0, _LAYERMEM_DIR)
 
-    # Optionally customize the LLM used by Mem0
-    "llm": {
-        "provider": "openai",
-        "config": {
-            "model": "gpt-4o-mini",
-            "temperature": 0.3,
-            "max_tokens": 1024
-        }
-    },
+    from agent_memory import ConversationMemory, ModifiedMemory, load_from_sqlite
+    from config import async_client as _mem_async_client, LLM_MODEL as _mem_llm_model  # type: ignore[import]
 
-    # Optionally configure your embedding model
-    "embedder": {
-        "provider": "openai",
-        "config": {
-            "model": "text-embedding-3-small"
-        }
-    }
-}
-
-# Lazy initialization of Memory to avoid import-time errors
-_memory_instance = None
-
-def get_memory():
-    """Get or initialize the Mem0 memory instance."""
-    global _memory_instance
-    if _memory_instance is None:
-        from mem0 import Memory
-        _memory_instance = Memory.from_config(config)
-        logger.info("Mem0 Memory instance initialized successfully")
-    return _memory_instance
-
+    _mem_inner = load_from_sqlite(MEMORY_DB_PATH) if os.path.exists(MEMORY_DB_PATH) else ModifiedMemory()
+    mem = ConversationMemory(_mem_inner, MEMORY_DB_PATH)
+    logger.info(f"LayerMem enabled (db: {MEMORY_DB_PATH})")
+else:
+    logger.info("LayerMem disabled (set memory.enabled: true in config.yaml to enable)")
 
 # -----------------------------------------
-# Memory Tool Functions
+# Episode boundary detection helpers
 # -----------------------------------------
 
-async def add_memory(
-    content: str,
-    # user_id: str = "default_user",
-    metadata: Optional[dict] = None
-) -> dict:
-    """
-    Add a new memory to the persistent memory store.
-    
-    Use this to store important information from conversations that should be 
-    remembered for future interactions, such as:
-    - User preferences and research interests
-    - Key findings from previous queries
-    - Important entities or concepts the user frequently asks about
-    
-    Args:
-        content: The text content to store as a memory. Should be a clear, 
-                 self-contained statement or fact.
-        metadata: Optional dictionary of additional metadata to attach to the memory.
-    
-    Returns:
-        dict: Contains status information
-            - success: bool indicating if memory was stored
-            - memory_id: ID of the created memory (if successful)
-            - message: Description of what was stored
-            - error: Error message (if unsuccessful)
-    
-    Example:
-        add_memory(
-            content="User is researching TP53 gene mutations in breast cancer",
-            metadata={"topic": "oncology", "gene": "TP53"}
-        )
-    """
-    log = logging.getLogger(f"{__name__}.memory")
-    user_id = "default_user"
+def _truncate_turn(lines: list) -> str:
+    parts = []
+    for line in lines:
+        if line.startswith("GLKBAgent:") and len(line) > 10 + AGENT_TEXT_LIMIT:
+            line = line[:10 + AGENT_TEXT_LIMIT] + "..."
+        parts.append(line)
+    return "\n".join(parts)
 
+
+async def _is_boundary(buffer_lines: list) -> bool:
+    """Ask the memory LLM if the most recent turn is a topic shift from the buffered episode."""
+    prior = "\n".join(_truncate_turn([l]) for l in buffer_lines[:-2])
+    latest = _truncate_turn(buffer_lines[-2:])
     try:
-        memory = get_memory()
-        
-        # Prepare messages format for Mem0
-        messages = [{"role": "user", "content": content}]
-        
-        # Add memory with optional metadata
-        result = memory.add(
-            messages=messages,
-            user_id=user_id,
-            metadata=metadata or {}
-        )
-        
-        log.info(f"Memory added for user {user_id}: {content[:50]}...")
-        
-        # Extract memory IDs from result
-        memory_ids = []
-        if isinstance(result, dict) and "results" in result:
-            memory_ids = [r.get("id") for r in result.get("results", []) if r.get("id")]
-        
-        return {
-            "success": True,
-            "memory_ids": memory_ids,
-            "message": f"Successfully stored memory for user '{user_id}'",
-            "content_preview": content[:100] + "..." if len(content) > 100 else content
-        }
-        
-    except Exception as e:
-        log.error(f"Error adding memory: {str(e)}")
-        return {
-            "success": False,
-            "error": f"Failed to add memory: {str(e)}"
-        }
-
-async def get_all_memories(
-    user_id: str = "default_user"
-) -> dict:
-    """
-    Retrieve all stored memories for a specific user.
-    
-    Use this to get a complete overview of what has been stored for a user,
-    useful for context building at the start of a session or for debugging.
-    
-    Args:
-        user_id: Identifier for the user/session (default: "default_user").
-    
-    Returns:
-        dict: Contains all memories
-            - success: bool indicating if retrieval was successful
-            - count: Total number of memories
-            - memories: List of all memories with their content and metadata
-            - error: Error message (if unsuccessful)
-    """
-    log = logging.getLogger(f"{__name__}.memory")
-    
-    try:
-        memory = get_memory()
-        
-        # Get all memories for user
-        results = memory.get_all(user_id=user_id)
-        
-        # Parse results
-        memories = []
-        if isinstance(results, dict) and "results" in results:
-            for r in results.get("results", []):
-                memories.append({
-                    "id": r.get("id"),
-                    "content": r.get("memory"),
-                    "metadata": r.get("metadata", {}),
-                    "created_at": r.get("created_at"),
-                    "updated_at": r.get("updated_at")
-                })
-        elif isinstance(results, list):
-            for r in results:
-                memories.append({
-                    "id": r.get("id"),
-                    "content": r.get("memory"),
-                    "metadata": r.get("metadata", {}),
-                    "created_at": r.get("created_at"),
-                    "updated_at": r.get("updated_at")
-                })
-        
-        log.info(f"Retrieved {len(memories)} total memories for user {user_id}")
-        
-        return {
-            "success": True,
-            "user_id": user_id,
-            "count": len(memories),
-            "memories": memories
-        }
-        
-    except Exception as e:
-        log.error(f"Error getting all memories: {str(e)}")
-        return {
-            "success": False,
-            "user_id": user_id,
-            "error": f"Failed to get memories: {str(e)}"
-        }
-
-async def search_memory(
-    query: str,
-    # user_id: str = "default_user",
-    limit: int = 5
-) -> dict:
-    """
-    Search for relevant memories based on a query.
-    
-    Use this to retrieve past context that may be relevant to the current 
-    conversation or query. The search uses semantic similarity to find 
-    the most relevant stored memories.
-    
-    Args:
-        query: The search query to find relevant memories. Can be a question,
-               topic, or any text that describes what you're looking for.
-        limit: Maximum number of memories to return (default: 5).
-    
-    Returns:
-        dict: Contains search results
-            - success: bool indicating if search was successful
-            - count: Number of memories found
-            - memories: List of relevant memories with their content and metadata
-            - error: Error message (if unsuccessful)
-    
-    Example:
-        search_memory(
-            query="What genes has the user asked about before?",
-            user_id="researcher_001",
-            limit=10
-        )
-    """
-    log = logging.getLogger(f"{__name__}.memory")
-    user_id = "default_user"
-
-    try:
-        memory = get_memory()
-        
-        # Search memories
-        results = memory.search(
-            query=query,
-            user_id=user_id,
-            limit=limit
-        )
-        
-        # Parse results
-        memories = []
-        if isinstance(results, dict) and "results" in results:
-            for r in results.get("results", []):
-                memories.append({
-                    "id": r.get("id"),
-                    "content": r.get("memory"),
-                    "score": r.get("score"),
-                    "metadata": r.get("metadata", {}),
-                    "created_at": r.get("created_at")
-                })
-        elif isinstance(results, list):
-            for r in results:
-                memories.append({
-                    "id": r.get("id"),
-                    "content": r.get("memory"),
-                    "score": r.get("score"),
-                    "metadata": r.get("metadata", {}),
-                    "created_at": r.get("created_at")
-                })
-        
-        log.info(f"Found {len(memories)} memories for query: {query[:50]}...")
-        
-        return {
-            "success": True,
-            "query": query,
-            "user_id": user_id,
-            "count": len(memories),
-            "memories": memories
-        }
-        
-    except Exception as e:
-        log.error(f"Error searching memory: {str(e)}")
-        return {
-            "success": False,
-            "query": query,
-            "error": f"Failed to search memory: {str(e)}"
-        }
-
-async def delete_memory(
-    memory_id: str
-) -> dict:
-    """
-    Delete a specific memory by its ID.
-    
-    Use this to remove outdated, incorrect, or no longer relevant memories.
-    
-    Args:
-        memory_id: The unique identifier of the memory to delete.
-    
-    Returns:
-        dict: Contains deletion status
-            - success: bool indicating if deletion was successful
-            - memory_id: ID of the deleted memory
-            - message: Confirmation message
-            - error: Error message (if unsuccessful)
-    """
-    log = logging.getLogger(f"{__name__}.memory")
-    
-    try:
-        memory = get_memory()
-        
-        # Delete the memory
-        memory.delete(memory_id=memory_id)
-        
-        log.info(f"Deleted memory: {memory_id}")
-        
-        return {
-            "success": True,
-            "memory_id": memory_id,
-            "message": f"Successfully deleted memory '{memory_id}'"
-        }
-        
-    except Exception as e:
-        log.error(f"Error deleting memory: {str(e)}")
-        return {
-            "success": False,
-            "memory_id": memory_id,
-            "error": f"Failed to delete memory: {str(e)}"
-        }
-
-async def add_cypher_memory(
-    natural_language_query: str,
-    query_type: str,
-    cypher_query: str,
-    outcome: str,
-    error_message: Optional[str] = None,
-    count: Optional[int] = None
-) -> dict:
-    """
-    Add a new memory to the persistent memory store.
-
-    Args:
-        natural_language_query: The natural language query to execute.
-        query_type: The type of query (e.g. "find relationships between genes and diseases", "count number of articles").
-        cypher_query: The generated Cypher query by the LLM.
-        outcome: The outcome of the Cypher query execution (success or error).
-        error_message: The error message of the Cypher query execution (if any) (default: None).
-        count: The number of records returned by the Cypher query execution (if any) (default: None).
-    
-    Returns:
-        dict: Contains status information
-            - success: bool indicating if memory was stored
-            - memory_id: ID of the created memory (if successful)
-            - message: Description of what was stored
-            - error: Error message (if unsuccessful)
-
-    Example:
-        add_cypher_memory(
-            natural_language_query="Find articles that contain the term 'breast cancer' in 2024",
-            cypher_query="MATCH (a:Article)-[:ContainTerm]->(v:Vocabulary {id: 'doid:10652'}) WHERE a.pubdate = 2024 RETURN DISTINCT a.title, a.abstract, a.pubmedid, a.n_citation, a.pubdate, a.authors LIMIT 100",
-            outcome="success",
-            count=100
-        )
-    """
-    log = logging.getLogger(f"{__name__}.memory")
-    user_id = "default_user"
-
-    try:
-        memory = get_memory()
-
-        # Prepare messages format for Mem0
-        messages = [
-            {
+        response = await _mem_async_client.chat.completions.create(  # type: ignore[name-defined]
+            model=_mem_llm_model,  # type: ignore[name-defined]
+            messages=[{
                 "role": "user",
-                "content": natural_language_query
-            }
-        ]
-        result = memory.add(
-            messages=messages,
-            user_id=user_id,
-            metadata={
-                "query_type": query_type,
-                "cypher_query": cypher_query,
-                "outcome": outcome,
-                "error_message": error_message,
-                "count": count
-            },
-            infer=False
+                "content": (
+                    "You are a conversation segmentation assistant for a biomedical research assistant.\n\n"
+                    "Current episode:\n"
+                    f"{prior}\n\n"
+                    "New turn:\n"
+                    f"{latest}\n\n"
+                    "Reply YES only if the new turn switches to a completely unrelated biomedical subject "
+                    "(e.g. an entirely different gene, disease, or research area with no connection to the episode above). "
+                    "Follow-up questions, clarifications, related entities, or deeper dives into the same subject are NO. "
+                    "When in doubt, reply NO. Reply YES or NO only."
+                ),
+            }],
+            max_tokens=5,
+            temperature=0,
         )
-
-        log.info(f"Cypher memory added for user {user_id}: {natural_language_query[:50]}...")
-
-        # Extract memory IDs from result
-        memory_ids = []
-        if isinstance(result, dict) and "results" in result:
-            memory_ids = [r.get("id") for r in result.get("results", []) if r.get("id")]
-        
-        return {
-            "success": True,
-            "memory_ids": memory_ids,
-            "message": f"Successfully stored Cypher memory for user '{user_id}'",
-            "content_preview": natural_language_query[:100] + "..." if len(natural_language_query) > 100 else natural_language_query
-        }
-        
+        answer = (response.choices[0].message.content or "").strip().upper()
+        return answer.startswith("YES")
     except Exception as e:
-        log.error(f"Error adding memory: {str(e)}")
-        return {
-            "success": False,
-            "error": f"Failed to add memory: {str(e)}"
-        }
+        logger.warning(f"Episode boundary check failed, keeping current episode: {e}")
+        return False
+
+
+async def _flush_keep_last_turn() -> None:
+    """Flush all turns except the most recent into an episode; latest turn seeds the new episode."""
+    global _flush_count
+    all_lines = list(mem._turn_buffers.get(_session_id, []))  # type: ignore[union-attr]
+    if len(all_lines) < 4:
+        return
+    to_flush = all_lines[:-2]
+    mem._turn_buffers[_session_id] = all_lines[-2:]  # type: ignore[union-attr]
+    content = "\n".join(to_flush)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    _flush_count += 1
+    source_id = f"{_session_id}_part{_flush_count}"
+    ingestion = mem._mem.add_content_async(content, source_id, "conversation", timestamp, False)
+    asyncio.create_task(ingestion)
+    if _flush_count % CONSOLIDATE_EVERY_N_FLUSHES == 0:
+        asyncio.create_task(mem.consolidate())
+
+
+async def _trigger_flush(wait: bool = False, consolidate: bool = True) -> None:
+    """Pop the turn buffer and ingest. Background by default; await if wait=True.
+
+    consolidate=False skips the periodic sleep_update — use this on shutdown
+    to avoid spawning a long-running task that may be killed mid-consolidation.
+    """
+    global _flush_count
+    lines = mem._turn_buffers.pop(_session_id, [])  # type: ignore[union-attr]
+    if not lines:
+        return
+    content = "\n".join(lines)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    _flush_count += 1
+    source_id = f"{_session_id}_part{_flush_count}"
+    ingestion = mem._mem.add_content_async(content, source_id, "conversation", timestamp, False)
+    if wait:
+        await ingestion
+    else:
+        asyncio.create_task(ingestion)
+    if consolidate and _flush_count % CONSOLIDATE_EVERY_N_FLUSHES == 0:
+        asyncio.create_task(mem.consolidate())
 
 # -----------------------------------------
-# Create FunctionTools for Google ADK
+# After-agent callback
 # -----------------------------------------
 
-add_memory_tool = FunctionTool(add_memory)
-search_memory_tool = FunctionTool(search_memory)
-add_cypher_memory_tool = FunctionTool(add_cypher_memory)
-# delete_memory_tool = FunctionTool(delete_memory)
+async def _memory_after_agent_callback(callback_context) -> None:
+    """Auto-buffer each turn; flush to LayerMem when the memory LLM detects a topic shift."""
+    if not _LAYERMEM_ENABLED or mem is None:
+        return None
 
-# Export all memory tools as a list for easy import
-memory_tools = [
-    add_memory_tool,
-    search_memory_tool,
-    # delete_memory_tool,
-    add_cypher_memory_tool,
-]
+    user_text = ""
+    if callback_context.user_content:
+        user_text = " ".join(
+            p.text for p in (getattr(callback_context.user_content, "parts", None) or [])
+            if getattr(p, "text", None)
+        )
 
-# For backwards compatibility and testing
-if __name__ == "__main__":
-    import asyncio
-    
-    async def test_memory():
-        # Test adding a memory
-        print("Testing add_memory...")
-        result = await add_memory(
-            content="User is interested in TP53 gene and its role in cancer.",
-            user_id="test_user"
-        )
-        print(f"Add result: {result}")
-        
-        # Test searching memory
-        print("\nTesting search_memory...")
-        result = await search_memory(
-            query="What genes is the user interested in?",
-            user_id="test_user"
-        )
-        print(f"Search result: {result}")
-        
-        # Test getting all memories
-        print("\nTesting get_all_memories...")
-        result = await get_all_memories(user_id="test_user")
-        print(f"Get all result: {result}")
-    
-    asyncio.run(test_memory())
+    agent_text = ""
+    for event in reversed(callback_context.session.events):
+        if event.author == "GLKBAgent" and event.content:
+            texts = [p.text for p in (event.content.parts or []) if getattr(p, "text", None)]
+            if texts:
+                agent_text = " ".join(texts)
+                break
+
+    if not user_text and not agent_text:
+        return None
+
+    if user_text:
+        mem.add_turn("User", user_text, session_id=_session_id)
+    if agent_text:
+        mem.add_turn("GLKBAgent", agent_text, session_id=_session_id)
+
+    logger.debug(f"Memory buffer | user={len(user_text)}chars agent={len(agent_text)}chars")
+
+    buffer_lines = mem._turn_buffers.get(_session_id, [])  # type: ignore[union-attr]
+    if len(buffer_lines) >= 4 and await _is_boundary(buffer_lines):
+        logger.info("Episode boundary detected — flushing buffer, keeping latest turn")
+        await _flush_keep_last_turn()
+
+    return None
+
+# -----------------------------------------
+# Agent-callable memory tools
+# -----------------------------------------
+
+async def query_memory(question: str) -> dict:
+    """Query long-term memory for relevant context from past sessions."""
+    if not _LAYERMEM_ENABLED:
+        return {"answer": "Memory is disabled. Set memory.enabled: true in config.yaml to enable."}
+    answer = await mem.answer(question)
+    return {"answer": answer}
+
+
+async def save_memory() -> dict:
+    """Flush current buffer, consolidate memory, and persist to disk."""
+    if not _LAYERMEM_ENABLED:
+        return {"status": "disabled"}
+    await _trigger_flush(wait=True)
+    await mem.consolidate(n_questions_per_chunk=1)
+    mem.save()
+    return {"status": "ok", "path": MEMORY_DB_PATH}
+
+# -----------------------------------------
+# MemoryToolset
+# -----------------------------------------
+
+class MemoryToolset(BaseToolset):
+    """Exposes memory tools and flushes + saves on runner shutdown."""
+
+    async def get_tools(self, readonly_context: ReadonlyContext = None) -> list:
+        return [FunctionTool(query_memory), FunctionTool(save_memory)]
+
+    async def close(self) -> None:
+        if not _LAYERMEM_ENABLED or mem is None:
+            return
+        await _trigger_flush(wait=True, consolidate=False)
+        mem.save()
+        logger.info("Memory flushed and saved on runner close.")
