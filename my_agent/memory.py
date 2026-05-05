@@ -76,10 +76,10 @@ async def _is_boundary(buffer_lines: list) -> bool:
                     f"{prior}\n\n"
                     "New turn:\n"
                     f"{latest}\n\n"
-                    "Reply YES only if the new turn switches to a completely unrelated biomedical subject "
-                    "(e.g. an entirely different gene, disease, or research area with no connection to the episode above). "
-                    "Follow-up questions, clarifications, related entities, or deeper dives into the same subject are NO. "
-                    "When in doubt, reply NO. Reply YES or NO only."
+                    "Reply YES only if the new turn switches to an unrelated biomedical subject "
+                    "(e.g. a different gene, disease, or research area with no connection to the episode above). "
+                    "Follow-up questions about the SAME content, clarifications, related entities, or deeper dives into the same subject are NO. "
+                    "Reply YES or NO only."
                 ),
             }],
             max_tokens=5,

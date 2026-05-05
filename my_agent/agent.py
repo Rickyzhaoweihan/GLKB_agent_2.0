@@ -58,7 +58,12 @@ from memory import MemoryToolset, _memory_after_agent_callback
 # -----------------------------------------
 # Model
 # -----------------------------------------
-LLM_MODEL = LiteLlm(model=cfg.agent.model, api_base=cfg.agent.api_base)
+API_KEY = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
+LLM_MODEL = LiteLlm(
+    model=cfg.agent.model,
+    api_base=cfg.agent.api_base,
+    api_key=API_KEY,
+)
 
 # -----------------------------------------
 # Skill Loading Helper
