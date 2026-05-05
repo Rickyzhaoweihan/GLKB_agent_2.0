@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from sklearn.metrics.pairwise import cosine_similarity as cos_sim
 from tqdm import tqdm
 
-from config import client, async_client, LLM_MODEL, EMBEDDING_MODEL
+from layermem_config import client, async_client, LLM_MODEL, EMBEDDING_MODEL
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sleep-update hyperparameters

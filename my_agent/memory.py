@@ -40,7 +40,7 @@ if _LAYERMEM_ENABLED:
     sys.path.insert(0, _LAYERMEM_DIR)
 
     from agent_memory import ConversationMemory, ModifiedMemory, load_from_sqlite
-    from config import async_client as _mem_async_client, LLM_MODEL as _mem_llm_model  # type: ignore[import]
+    from layermem_config import async_client as _mem_async_client, LLM_MODEL as _mem_llm_model  # type: ignore[import]
 
     _mem_inner = load_from_sqlite(MEMORY_DB_PATH) if os.path.exists(MEMORY_DB_PATH) else ModifiedMemory()
     mem = ConversationMemory(_mem_inner, MEMORY_DB_PATH)
