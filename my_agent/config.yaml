@@ -34,6 +34,3 @@ memory:
   # Run memory consolidation every N episode flushes
   consolidate_every_n_flushes: 10
 
-  # Similarity thresholds for merging memory nodes
-  concept_merge_threshold: 0.75
-  reflection_merge_threshold: 0.80
