@@ -21,13 +21,15 @@ import dotenv
 
 dotenv.load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
+from config import cfg
+
 # -----------------------------------------
 # Logging (standard Python logging per ADK guide)
 # -----------------------------------------
 
 LOG_DIR = os.getenv(
     "AGENTS_LOG_DIR",
-    os.path.join(os.path.dirname(__file__), "..", "agent_logs"),
+    os.path.join(os.path.dirname(__file__), "..", cfg.paths.log_dir),
 )
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -55,7 +57,7 @@ from tools import glkb_tools, pubmed_tools
 # -----------------------------------------
 # Model
 # -----------------------------------------
-LLM_MODEL = LiteLlm(model="openai/gpt-5.2")
+LLM_MODEL = LiteLlm(model=cfg.agent.model, api_base=cfg.agent.api_base)
 
 # -----------------------------------------
 # Skill Loading Helper
