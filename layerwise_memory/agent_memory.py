@@ -355,16 +355,25 @@ class ConnectionManager4:
     def total_connections(self):
         return sum(len(v) for v in self.connections.values())
 
+class _FallbackTokenizer:
+    """Word-split tokenizer used when tiktoken cannot be downloaded.
+    Approximate: 1 word ≈ 1 token. Accurate enough for chunking purposes."""
+    def encode(self, text: str) -> List[str]:
+        return text.split()
+    def decode(self, tokens: List[str]) -> str:
+        return " ".join(tokens)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Modified Memory
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ModifiedMemory:
 
-    CONCEPT_THRESHOLD    = 0.75
+    CONCEPT_THRESHOLD    = 0.65
     REFLECTION_THRESHOLD = 0.85
     CHUNK_SIZE           = 600
     CHUNK_OVERLAP        = 100
+    USE_BM25             = False
 
     def __init__(self):
         self.concepts:    Dict[str, Concept4]          = {}
@@ -393,6 +402,7 @@ class ModifiedMemory:
         self.source_registry: Dict[str, List[str]] = {}  # source_id -> [traj_ids]
         self._docs_since_sleep:  List[str] = []  # source_ids of new docs
         self._convs_since_sleep: List[str] = []  # source_ids of new conversations
+        self._trajs_since_sleep: List[str] = []  # traj_ids added since last sleep
 
         # diagnostics populated by sleep_update_async; persisted to snapshot
         self.last_sleep_stats: Dict = {}
@@ -401,23 +411,33 @@ class ModifiedMemory:
         # Initial value is conservative; sleep adapts it based on gold reflection ranks.
         self._adapted_top_k: int = 5
 
-        # Diagnostic: number of queries where temporal filtering was triggered.
-        # Should be 0 on the LoCoMo benchmark (no explicit-date questions).
+        # Tokenizer is initialized lazily on first _chunk() call to avoid
+        # blocking agent startup on a tiktoken network download.
+        self._tokenizer = None
+
+    def _get_tokenizer(self):
+        if self._tokenizer is not None:
+            return self._tokenizer
         try:
             self._tokenizer = tiktoken.encoding_for_model(EMBEDDING_MODEL)
-        except KeyError:
-            self._tokenizer = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            try:
+                self._tokenizer = tiktoken.get_encoding("cl100k_base")
+            except Exception:
+                self._tokenizer = _FallbackTokenizer()
+        return self._tokenizer
 
     # ── chunking ──────────────────────────────────────────────────────────────
 
     def _chunk(self, text: str) -> List[str]:
-        tokens = self._tokenizer.encode(text)
+        tok = self._get_tokenizer()
+        tokens = tok.encode(text)
         if len(tokens) <= self.CHUNK_SIZE:
             return [text]
         chunks, start = [], 0
         while start < len(tokens):
             end = start + self.CHUNK_SIZE
-            chunk_text = self._tokenizer.decode(tokens[start:end])
+            chunk_text = tok.decode(tokens[start:end])
             if chunk_text.strip():
                 chunks.append(chunk_text.strip())
             if end >= len(tokens):
@@ -499,7 +519,7 @@ Recent conversations:
 Instructions:
 1. Identify every distinct participant / speaker in the conversations (e.g. "Alice", "Bob", "User", "Assistant", or any name/role that appears).
 2. For each participant, write or update a persona summary that captures their identity, interests, background, preferences, personality, and communication style as revealed by the conversations.
-3. Each individual summary must be at most 100 words.
+3. Each individual summary must be at most 200 words.
 4. Only update a participant's summary if the new conversations add meaningful information.
 5. Preserve participants from the current summaries even if they do not appear in the new conversations.
 
@@ -580,28 +600,247 @@ Return JSON with "merged": list of statement strings."""
         # fallback: keep existing, append truly new ones up to max
         return (existing + [s for s in new if s not in existing])[:max_items]
 
+    async def _async_merge_reflection_lists(self, existing: List[str], new: List[str], max_items: int = 10) -> List[str]:
+        """Async version of _merge_reflection_lists. Used by _consolidate_concepts_async fold steps."""
+        existing_fmt = "\n".join(f"{i+1}. {s}" for i, s in enumerate(existing))
+        new_fmt      = "\n".join(f"{i+1}. {s}" for i, s in enumerate(new))
+        try:
+            result = await async_llm(
+                async_client,
+                "You merge lists of factual statements. Respond in JSON.",
+                f"""Merge these two lists of factual statements into one consolidated list (at most {max_items} items).
+
+Existing statements:
+{existing_fmt}
+
+New statements:
+{new_fmt}
+
+Rules:
+- Combine statements that say the same thing (keep the more specific/complete version)
+- Preserve all distinct facts
+- Each statement must be self-contained and understandable without context
+- Return at most {max_items} statements
+
+Return JSON with "merged": list of statement strings."""
+            )
+            merged = result.get("merged", [])
+            if merged and isinstance(merged, list):
+                return merged[:max_items]
+        except Exception:
+            pass
+        return (existing + [s for s in new if s not in existing])[:max_items]
+
+    async def _consolidate_concepts_async(self) -> None:
+        """Sleep-time consolidation: merge redundant reflections within overloaded concept clusters.
+
+        Flags concepts whose out-degree (number of linked reflections) exceeds mean + 2*std.
+        Within each flagged cluster, finds reflection pairs above REFLECTION_THRESHOLD, builds
+        connected components, sorts each component by earliest trajectory timestamp, then folds
+        each component into one reflection sequentially while running all components in parallel."""
+        if not self.concepts:
+            return
+
+        out_degrees = {cid: len(self.conn_c2r.get(cid)) for cid in self.concepts}
+        degrees = list(out_degrees.values())
+        mean_deg = float(np.mean(degrees))
+        std_deg  = float(np.std(degrees))
+
+        if std_deg == 0:
+            return
+
+        threshold = mean_deg + 2 * std_deg
+        flagged = [cid for cid, deg in out_degrees.items() if deg > threshold]
+        if not flagged:
+            return
+
+        print(f"  Consolidating {len(flagged)} overloaded concept cluster(s)...")
+
+        # Build adjacency from candidate pairs across all flagged concepts
+        adj: Dict[str, Set[str]] = defaultdict(set)
+        for cid in flagged:
+            rids = [rid for rid in self.conn_c2r.get(cid) if rid in self.reflections]
+            if len(rids) < 2:
+                continue
+            rembs = np.array([self.reflections[rid].embedding for rid in rids])
+            for i in range(len(rids)):
+                for j in range(i + 1, len(rids)):
+                    sim = float(cos_sim(rembs[i].reshape(1, -1), rembs[j].reshape(1, -1))[0][0])
+                    if sim >= self.REFLECTION_THRESHOLD:
+                        adj[rids[i]].add(rids[j])
+                        adj[rids[j]].add(rids[i])
+
+        if not adj:
+            return
+
+        # Find connected components via BFS
+        visited: Set[str] = set()
+        components: List[List[str]] = []
+        for start in list(adj.keys()):
+            if start in visited:
+                continue
+            component: List[str] = []
+            queue = [start]
+            while queue:
+                node = queue.pop(0)
+                if node in visited:
+                    continue
+                visited.add(node)
+                component.append(node)
+                queue.extend(adj[node] - visited)
+            if len(component) >= 2:
+                components.append(component)
+
+        if not components:
+            return
+
+        # Sort each component by earliest linked trajectory timestamp
+        def _earliest_ts(rid: str) -> str:
+            timestamps = []
+            for ts_id in self.reflections[rid].trajectory_summary_ids:
+                ts_obj = self.traj_sums.get(ts_id)
+                if ts_obj:
+                    traj = self.trajectories.get(ts_obj.trajectory_id)
+                    if traj and traj.timestamp:
+                        timestamps.append(traj.timestamp)
+            return min(timestamps) if timestamps else ""
+
+        sorted_components = [sorted(comp, key=_earliest_ts) for comp in components]
+
+        # Fold each component sequentially; run all components in parallel
+        async def _fold(comp: List[str]) -> Tuple[str, List[str]]:
+            rid_keep = comp[0]
+            merged_list = list(self.reflections[rid_keep].reflection_list)
+            for rid_next in comp[1:]:
+                merged_list = await self._async_merge_reflection_lists(
+                    merged_list, self.reflections[rid_next].reflection_list
+                )
+            return rid_keep, merged_list
+
+        fold_results = await asyncio.gather(
+            *[_fold(comp) for comp in sorted_components],
+            return_exceptions=True,
+        )
+
+        # Collect texts to batch-embed
+        embed_texts: List[str] = []
+        embed_idx:   Dict[str, int] = {}
+
+        def _register(t: str) -> None:
+            if t not in embed_idx:
+                embed_idx[t] = len(embed_texts)
+                embed_texts.append(t)
+
+        valid: List[Tuple[List[str], str, List[str]]] = []  # (comp, rid_keep, merged_list)
+        for comp, result in zip(sorted_components, fold_results):
+            if isinstance(result, Exception):
+                print(f"    Fold failed for component starting {comp[0]}: {result}")
+                continue
+            rid_keep, merged_list = result
+            valid.append((comp, rid_keep, merged_list))
+            _register(" ".join(merged_list))
+            for item in merged_list:
+                _register(item)
+
+        if not valid:
+            return
+
+        all_embs = await async_embed(embed_texts)
+
+        already_dropped: Set[str] = set()
+        n_consolidated = 0
+
+        for comp, rid_keep, merged_list in valid:
+            if rid_keep in already_dropped:
+                continue
+            rid_drops = [r for r in comp[1:] if r not in already_dropped and r in self.reflections]
+            if not rid_drops:
+                continue
+
+            r_keep = self.reflections[rid_keep]
+            joined  = " ".join(merged_list)
+            r_keep.reflection_list  = merged_list
+            r_keep.embedding        = all_embs[embed_idx[joined]]
+            r_keep.item_embeddings  = [all_embs[embed_idx[item]] for item in merged_list if item in embed_idx]
+
+            for rid_drop in rid_drops:
+                r_drop = self.reflections[rid_drop]
+                for cid in r_drop.concept_ids:
+                    if cid not in r_keep.concept_ids:
+                        r_keep.concept_ids.append(cid)
+                for ts_id in r_drop.trajectory_summary_ids:
+                    if ts_id not in r_keep.trajectory_summary_ids:
+                        r_keep.trajectory_summary_ids.append(ts_id)
+
+            # Update TrajectorySummary4.reflection_id
+            for rid_drop in rid_drops:
+                for ts_id in self.reflections[rid_drop].trajectory_summary_ids:
+                    if ts_id in self.traj_sums:
+                        self.traj_sums[ts_id].reflection_id = rid_keep
+
+            # Update Concept4.reflection_ids
+            for cid in self.concepts:
+                c = self.concepts[cid]
+                rid_keep_present = rid_keep in c.reflection_ids
+                new_ids: List[str] = []
+                changed = False
+                for rr in c.reflection_ids:
+                    if rr in rid_drops:
+                        changed = True
+                        if not rid_keep_present:
+                            new_ids.append(rid_keep)
+                            rid_keep_present = True
+                    else:
+                        new_ids.append(rr)
+                if changed:
+                    c.reflection_ids = new_ids
+
+            # Update conn_c2r (concept → reflection)
+            for cid in list(self.conn_c2r.connections.keys()):
+                for rid_drop in rid_drops:
+                    if rid_drop in self.conn_c2r.connections[cid]:
+                        self.conn_c2r.connections[cid].discard(rid_drop)
+                        self.conn_c2r.connections[cid].add(rid_keep)
+                        old_key = (cid, rid_drop)
+                        new_key = (cid, rid_keep)
+                        if old_key in self.conn_c2r.stats:
+                            old_st = self.conn_c2r.stats.pop(old_key)
+                            if new_key in self.conn_c2r.stats:
+                                self.conn_c2r.stats[new_key].times_traversed  += old_st.times_traversed
+                                self.conn_c2r.stats[new_key].times_led_to_gold += old_st.times_led_to_gold
+                            else:
+                                self.conn_c2r.stats[new_key] = old_st
+
+            # Update conn_r2s (reflection → traj_summary)
+            for rid_drop in rid_drops:
+                for ts_id in set(self.conn_r2s.connections.get(rid_drop, set())):
+                    self.conn_r2s.connections[rid_keep].add(ts_id)
+                    old_key = (rid_drop, ts_id)
+                    new_key = (rid_keep, ts_id)
+                    if old_key in self.conn_r2s.stats:
+                        old_st = self.conn_r2s.stats.pop(old_key)
+                        if new_key in self.conn_r2s.stats:
+                            self.conn_r2s.stats[new_key].times_traversed   += old_st.times_traversed
+                            self.conn_r2s.stats[new_key].times_led_to_gold += old_st.times_led_to_gold
+                        else:
+                            self.conn_r2s.stats[new_key] = old_st
+                if rid_drop in self.conn_r2s.connections:
+                    del self.conn_r2s.connections[rid_drop]
+
+            for rid_drop in rid_drops:
+                del self.reflections[rid_drop]
+                already_dropped.add(rid_drop)
+
+            n_consolidated += len(rid_drops)
+
+        print(f"  Consolidated {n_consolidated} reflection(s) across {len(valid)} component(s).")
+
     def _get_or_create_reflection(self, refl_list: List[str], ts_id: str,
                                    emb: Optional[np.ndarray] = None,
                                    item_embs: Optional[List[np.ndarray]] = None) -> str:
         joined = " ".join(refl_list)
         if emb is None:
             emb = embed([joined])[0]
-        if self.reflections:
-            rids = list(self.reflections.keys())
-            rembs = np.array([self.reflections[r].embedding for r in rids])
-            matches = top_k_sim(emb, rembs, k=1)
-            if matches and matches[0][1] >= self.REFLECTION_THRESHOLD:
-                rid = rids[matches[0][0]]
-                r = self.reflections[rid]
-                merged = self._merge_reflection_lists(r.reflection_list, refl_list)
-                r.reflection_list = merged
-                # Embed joined text + all individual items in one call
-                merged_all = embed([" ".join(merged)] + merged)
-                r.embedding = merged_all[0]
-                r.item_embeddings = list(merged_all[1:])
-                if ts_id not in r.trajectory_summary_ids:
-                    r.trajectory_summary_ids.append(ts_id)
-                return rid
         rid = str(uuid.uuid4())
         self.reflections[rid] = Reflection4(id=rid, reflection_list=refl_list,
                                             embedding=emb, trajectory_summary_ids=[ts_id],
@@ -729,6 +968,7 @@ Return JSON with "merged": list of statement strings."""
             traj_ids.append(traj_id)
 
         self.source_registry[source_id] = traj_ids
+        self._trajs_since_sleep.extend(traj_ids)
 
         if source_type == "document":
             self._docs_since_sleep.append(source_id)
@@ -907,8 +1147,11 @@ Return JSON with "supplementary_list": list of new statement strings."""
         if build_rubrics and self._docs_since_sleep:
             await self._build_rubrics_async()
 
+        await self._consolidate_concepts_async()
+
         self._docs_since_sleep.clear()
         self._convs_since_sleep.clear()
+        self._trajs_since_sleep.clear()
         print("  Sleep update done.")
 
     async def _build_rubrics_async(self):
@@ -996,7 +1239,7 @@ Return JSON with "supplementary_list": list of new statement strings."""
         Returns a flat list of question dicts, each with keys:
             question, gold_answer, expected_facts, category, source_traj_ids
         """
-        traj_ids = list(self.trajectories.keys())
+        traj_ids = [tid for tid in self._trajs_since_sleep if tid in self.trajectories]
         all_questions: List[Dict] = []
 
         # ── Single-hop: one trajectory, n_single_hop questions ───────────────
@@ -1059,7 +1302,7 @@ Return JSON with "supplementary_list": list of new statement strings."""
                     # Carry both forms; gold_answer is relative for display/logging
                     q["gold_answer"] = q.get("gold_answer_relative", "")
                 return qs
-            except Exception:
+            except Exception as error:
                 print(f"    [_gen_temporal] traj {tid[:8]}: {type(error).__name__}: {error}", file=sys.stderr)
                 return []
 
@@ -1120,7 +1363,7 @@ Return JSON with "supplementary_list": list of new statement strings."""
                         q["category"] = "multi_hop"
                         q["source_traj_ids"] = [tid_a, tid_b]
                     return qs
-                except Exception:
+                except Exception as error:
                     print(f"    [_gen_multi_hop] traj {tid[:8]}: {type(error).__name__}: {error}", file=sys.stderr)
                     return []
 
@@ -1292,6 +1535,7 @@ Return JSON with "supplementary_list": list of new statement strings."""
                 source_traj_ids      = qd.get("source_traj_ids", []),
                 gold_answer_relative = qd.get("gold_answer_relative"),
                 gold_answer_absolute = qd.get("gold_answer_absolute"),
+                query_embeddings     = qc_pr_embs,
             )))
 
             # Phase 2: hard negative identification
@@ -1520,7 +1764,6 @@ Return JSON with "supplementary_list": list of new statement strings."""
         print(f"    Credit assignment branches: {_ca_counts}")
 
         # ── Adaptive top_k update ─────────────────────────────────────────────
-        MAX_TOP_K_CAP = 30
         wrong_needed_ks = [
             k for k, (qd, _), gr in zip(_needed_ks, _grade_jobs, grade_results)
             if k is not None
@@ -1528,8 +1771,7 @@ Return JSON with "supplementary_list": list of new statement strings."""
             and not gr.get("correct", False)
         ]
         if wrong_needed_ks:
-            new_top_k = int(np.percentile(wrong_needed_ks, 80))
-            new_top_k = min(max(new_top_k, 1), MAX_TOP_K_CAP)
+            new_top_k = max(int(max(wrong_needed_ks)), 5)
             self._adapted_top_k = new_top_k
             print(
                 f"    Adaptive top_k updated → {self._adapted_top_k} "
@@ -1733,6 +1975,7 @@ Return JSON with "supplementary_list": list of new statement strings."""
         max_items: int = 60,
         gold_answer_relative: Optional[str] = None,
         gold_answer_absolute: Optional[str] = None,
+        query_embeddings: Optional[np.ndarray] = None,
     ) -> Dict:
         """Grade a training question against its gold answer.
 
@@ -1746,9 +1989,10 @@ Return JSON with "supplementary_list": list of new statement strings."""
             gold_in_top_items    – bool  (gold reflection's items present in filtered set)
         """
         # ── 1. Assemble items from retrieved reflections (with timestamps) ────
-        plain_items:   List[str] = []
-        display_items: List[str] = []
-        gold_item_set: Set[str]  = set()
+        plain_items:      List[str]                   = []
+        display_items:    List[str]                   = []
+        stored_item_embs: List[Optional[np.ndarray]]  = []
+        gold_item_set:    Set[str]                    = set()
 
         for rid in mr:
             r = self.reflections.get(rid)
@@ -1762,9 +2006,11 @@ Return JSON with "supplementary_list": list of new statement strings."""
                     if t:
                         ts = t.timestamp
             ts_tag = f"[{ts}] " if ts else ""
-            for item in r.reflection_list:
+            stored_ok = len(r.item_embeddings) == len(r.reflection_list)
+            for i, item in enumerate(r.reflection_list):
                 plain_items.append(item)
                 display_items.append(f"{ts_tag}{item}")
+                stored_item_embs.append(r.item_embeddings[i] if stored_ok else None)
                 if rid in gold_r:
                     gold_item_set.add(item)
 
@@ -1772,16 +2018,25 @@ Return JSON with "supplementary_list": list of new statement strings."""
         filtered_display: List[str]
         if plain_items:
             try:
-                q_embs, item_embs_arr = await asyncio.gather(
-                    async_embed(query_texts),
-                    async_embed(plain_items),
-                )
-                sem_mat      = cos_sim(q_embs, item_embs_arr)               # (Q, N)
-                bm25_raw     = self._bm25_score_items(query_texts, plain_items)
-                bm25_row_max = bm25_raw.max(axis=1, keepdims=True)
-                bm25_row_max = np.where(bm25_row_max > 0, bm25_row_max, 1.0)
-                bm25_norm    = bm25_raw / bm25_row_max
-                combined     = 0.6 * sem_mat + 0.4 * bm25_norm             # (Q, N)
+                # Reuse pre-computed embeddings where available
+                q_embs       = query_embeddings
+                all_stored   = [e for e in stored_item_embs if e is not None]
+                item_embs_arr = np.array(all_stored) if len(all_stored) == len(plain_items) else None
+                if q_embs is None and item_embs_arr is None:
+                    q_embs, item_embs_arr = await asyncio.gather(
+                        async_embed(query_texts), async_embed(plain_items))
+                elif q_embs is None:
+                    q_embs = await async_embed(query_texts)
+                elif item_embs_arr is None:
+                    item_embs_arr = await async_embed(plain_items)
+                sem_mat = cos_sim(q_embs, item_embs_arr)                    # (Q, N)
+                if self.USE_BM25:
+                    bm25_raw     = self._bm25_score_items(query_texts, plain_items)
+                    bm25_row_max = bm25_raw.max(axis=1, keepdims=True)
+                    bm25_row_max = np.where(bm25_row_max > 0, bm25_row_max, 1.0)
+                    combined     = 0.6 * sem_mat + 0.4 * (bm25_raw / bm25_row_max)  # (Q, N)
+                else:
+                    combined     = sem_mat                                  # (Q, N)
                 item_scores  = np.max(combined, axis=0)                    # (N,)
                 ranked       = sorted(range(len(plain_items)),
                                       key=lambda i: item_scores[i], reverse=True)
@@ -1991,15 +2246,14 @@ Return JSON with "supplementary_list": list of new statement strings."""
             item_embs = embed(all_items)
         sem_sims = np.max(cos_sim(embs, item_embs), axis=0)  # (n_items,)
 
-        # BM25 scores per item: max over pred_refls, then top-2 avg per reflection
-        bm25_raw = self._bm25_score_items(pred_refls, all_items)  # (n_queries, n_items)
-        bm25_sims = np.max(bm25_raw, axis=0)  # (n_items,) — best query match per item
-        # normalise BM25 to [0, 1]
-        bm25_max = float(bm25_sims.max())
-        bm25_norm = bm25_sims / bm25_max if bm25_max > 0 else bm25_sims
-
-        # combined score: 60% semantic + 40% BM25
-        combined = 0.6 * sem_sims + 0.4 * bm25_norm
+        if self.USE_BM25:
+            bm25_raw  = self._bm25_score_items(pred_refls, all_items)
+            bm25_sims = np.max(bm25_raw, axis=0)
+            bm25_max  = float(bm25_sims.max())
+            bm25_norm = bm25_sims / bm25_max if bm25_max > 0 else bm25_sims
+            combined  = 0.6 * sem_sims + 0.4 * bm25_norm
+        else:
+            combined  = sem_sims
 
         # aggregate per reflection: top-2 average of combined scores
         rid_scores: Dict[str, List[float]] = defaultdict(list)
@@ -2178,7 +2432,7 @@ Return JSON: {{"confidence": "high" or "low", "start_date": "YYYY-MM-DD" or null
             return None
 
     async def async_retrieve(self, question: str, top_k: Optional[int] = None,
-                              use_query_components: bool = True
+                              use_query_components: bool = False
                               ) -> Tuple[Dict, Dict, Dict, Dict, QueryComponents4]:
         """Async version of retrieve: async LLM for query components + batched async embeds.
 
@@ -2291,8 +2545,9 @@ Which rubric type best fits this question? Use "general_qa" for simple factual q
                         return t.timestamp
             return ""
 
-        plain_groups:   List[List[str]] = []
-        display_groups: List[List[str]] = []
+        plain_groups:      List[List[str]]                     = []
+        display_groups:    List[List[str]]                     = []
+        stored_emb_groups: List[List[Optional[np.ndarray]]]   = []
         for rid in list(mr.keys())[:top_k]:
             r = self.reflections.get(rid)
             if r:
@@ -2300,23 +2555,38 @@ Which rubric type best fits this question? Use "general_qa" for simple factual q
                 ts_tag = f"[{ts}] " if ts else ""
                 plain_groups.append(list(r.reflection_list))
                 display_groups.append([f"{ts_tag}{item}" for item in r.reflection_list])
+                stored_ok = len(r.item_embeddings) == len(r.reflection_list)
+                stored_emb_groups.append(
+                    [r.item_embeddings[i] if stored_ok else None
+                     for i in range(len(r.reflection_list))]
+                )
 
         all_plain   = [item for g in plain_groups   for item in g]
         all_display = [item for g in display_groups for item in g]
+        all_stored_embs = [e for g in stored_emb_groups for e in g]
 
         # ── Per-item hybrid scoring (semantic + BM25) ─────────────────────────
         query_texts = (qc.predicted_reflections
                        if qc is not None and qc.predicted_reflections else [question])
 
-        _gather_tasks = [async_embed(query_texts), async_embed(all_plain)]
+        _all_stored = [e for e in all_stored_embs if e is not None]
+        _need_item_embs = len(_all_stored) != len(all_plain)
+        _gather_tasks: list = [async_embed(query_texts)]
+        if _need_item_embs:
+            _gather_tasks.append(async_embed(all_plain))
         if self.persona.entries:
             _gather_tasks.append(async_embed([question]))
         _results = await asyncio.gather(*_gather_tasks, return_exceptions=True)
 
-        q_embs    = _results[0] if not isinstance(_results[0], Exception) else None
-        item_embs = _results[1] if not isinstance(_results[1], Exception) else None
+        q_embs = _results[0] if not isinstance(_results[0], Exception) else None
+        _idx = 1
+        if _need_item_embs:
+            item_embs = _results[_idx] if not isinstance(_results[_idx], Exception) else None
+            _idx += 1
+        else:
+            item_embs = np.array(_all_stored)
         _persona_emb = (
-            (_results[2][0] if not isinstance(_results[2], Exception) else None)
+            (_results[_idx][0] if not isinstance(_results[_idx], Exception) else None)
             if self.persona.entries else None
         )
 
@@ -2324,11 +2594,14 @@ Which rubric type best fits this question? Use "general_qa" for simple factual q
         filtered_plain = all_plain
         if q_embs is not None and item_embs is not None and all_plain:
             try:
-                sem_mat      = cos_sim(q_embs, item_embs)                              # (Q, N)
-                bm25_raw     = self._bm25_score_items(query_texts, all_plain)          # (Q, N)
-                bm25_row_max = bm25_raw.max(axis=1, keepdims=True)
-                bm25_row_max = np.where(bm25_row_max > 0, bm25_row_max, 1.0)
-                combined_mat = 0.6 * sem_mat + 0.4 * (bm25_raw / bm25_row_max)        # (Q, N)
+                sem_mat = cos_sim(q_embs, item_embs)                                   # (Q, N)
+                if self.USE_BM25:
+                    bm25_raw     = self._bm25_score_items(query_texts, all_plain)
+                    bm25_row_max = bm25_raw.max(axis=1, keepdims=True)
+                    bm25_row_max = np.where(bm25_row_max > 0, bm25_row_max, 1.0)
+                    combined_mat = 0.6 * sem_mat + 0.4 * (bm25_raw / bm25_row_max)    # (Q, N)
+                else:
+                    combined_mat = sem_mat                                              # (Q, N)
                 item_scores  = np.max(combined_mat, axis=0)                            # (N,)
 
                 flat_to_group: List[Tuple[int, int]] = [
@@ -2658,6 +2931,7 @@ def save_to_sqlite(db_path: str, mem: "ModifiedMemory") -> None:
         "source_registry":      json.dumps(mem.source_registry),
         "_docs_since_sleep":    json.dumps(mem._docs_since_sleep),
         "_convs_since_sleep":   json.dumps(mem._convs_since_sleep),
+        "_trajs_since_sleep":   json.dumps(mem._trajs_since_sleep),
         "last_sleep_stats":     json.dumps(mem.last_sleep_stats),
         "_adapted_top_k":       json.dumps(mem._adapted_top_k),
         "persona_last_updated": mem.persona.last_updated,
@@ -2753,6 +3027,7 @@ def load_from_sqlite(db_path: str) -> "ModifiedMemory":
     mem.source_registry    = json.loads(meta.get("source_registry", "{}"))
     mem._docs_since_sleep  = json.loads(meta.get("_docs_since_sleep", "[]"))
     mem._convs_since_sleep = json.loads(meta.get("_convs_since_sleep", "[]"))
+    mem._trajs_since_sleep = json.loads(meta.get("_trajs_since_sleep", "[]"))
     mem.last_sleep_stats   = json.loads(meta.get("last_sleep_stats", "{}"))
     mem._adapted_top_k     = json.loads(meta.get("_adapted_top_k", "5"))
 
