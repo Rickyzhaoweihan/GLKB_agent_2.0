@@ -199,8 +199,9 @@ async def query_memory(question: str, tool_context=None) -> dict:
     """Query long-term memory for relevant context from past sessions."""
     if not _LAYERMEM_ENABLED:
         return {"answer": "Memory is disabled. Set memory.enabled: true in config.yaml to enable."}
-    # tool_context is injected by ADK; user_id is a direct attribute on Context
-    user_id = tool_context.user_id  # type: ignore[union-attr]
+    if tool_context is None:
+        return {"answer": "Memory unavailable: tool_context not injected by ADK."}
+    user_id = tool_context.user_id
     mem = _get_user_mem(user_id)
     answer = await mem.answer(question)
     return {"answer": answer}
@@ -210,7 +211,9 @@ async def save_memory(tool_context=None) -> dict:
     """Flush current buffer, consolidate memory, and persist to disk."""
     if not _LAYERMEM_ENABLED:
         return {"status": "disabled"}
-    user_id = tool_context.user_id  # type: ignore[union-attr]
+    if tool_context is None:
+        return {"status": "error", "detail": "tool_context not injected by ADK."}
+    user_id = tool_context.user_id
     session_id = tool_context.session.id
     mem = _get_user_mem(user_id)
     await _trigger_flush(mem, session_id, wait=True)

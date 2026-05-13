@@ -2989,64 +2989,66 @@ def _pg_connect(conn_params: dict):
 
 
 def save_to_postgres(conn_params: dict, user_id: str, mem: "ModifiedMemory") -> None:
-    """Serialize a ModifiedMemory instance for one user into a shared PostgreSQL database."""
+    """Serialize a ModifiedMemory instance for one user into the layermem schema."""
     with _pg_connect(conn_params) as con:
         cur = con.cursor()
 
+        cur.execute("CREATE SCHEMA IF NOT EXISTS layermem")
+
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS concepts (
+            CREATE TABLE IF NOT EXISTS layermem.concepts (
                 user_id TEXT, id TEXT, text TEXT, embedding BYTEA, reflection_ids TEXT,
                 PRIMARY KEY (user_id, id)
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS reflections (
+            CREATE TABLE IF NOT EXISTS layermem.reflections (
                 user_id TEXT, id TEXT, reflection_list TEXT, embedding BYTEA,
                 concept_ids TEXT, trajectory_summary_ids TEXT,
                 PRIMARY KEY (user_id, id)
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS reflection_item_embeddings (
+            CREATE TABLE IF NOT EXISTS layermem.reflection_item_embeddings (
                 user_id TEXT, reflection_id TEXT, idx INTEGER, embedding BYTEA,
                 PRIMARY KEY (user_id, reflection_id, idx)
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS traj_sums (
+            CREATE TABLE IF NOT EXISTS layermem.traj_sums (
                 user_id TEXT, id TEXT, text TEXT, embedding BYTEA,
                 reflection_id TEXT, trajectory_id TEXT,
                 PRIMARY KEY (user_id, id)
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS trajectories (
+            CREATE TABLE IF NOT EXISTS layermem.trajectories (
                 user_id TEXT, id TEXT, chunk_text TEXT, timestamp TEXT,
                 source_id TEXT, source_type TEXT, summary_id TEXT, concept_ids TEXT,
                 PRIMARY KEY (user_id, id)
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS persona_entries (
+            CREATE TABLE IF NOT EXISTS layermem.persona_entries (
                 user_id TEXT, name TEXT, summary TEXT, embedding BYTEA,
                 PRIMARY KEY (user_id, name)
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS rubrics (
+            CREATE TABLE IF NOT EXISTS layermem.rubrics (
                 user_id TEXT, doc_type TEXT, instructions TEXT,
                 PRIMARY KEY (user_id, doc_type)
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS connections (
+            CREATE TABLE IF NOT EXISTS layermem.connections (
                 user_id TEXT, table_name TEXT, src TEXT, tgt TEXT,
                 times_traversed INTEGER, times_led_to_gold INTEGER, newly_added INTEGER,
                 PRIMARY KEY (user_id, table_name, src, tgt)
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS metadata (
+            CREATE TABLE IF NOT EXISTS layermem.metadata (
                 user_id TEXT, key TEXT, value TEXT,
                 PRIMARY KEY (user_id, key)
             )
@@ -3055,41 +3057,41 @@ def save_to_postgres(conn_params: dict, user_id: str, mem: "ModifiedMemory") -> 
         for table in ("concepts", "reflections", "reflection_item_embeddings",
                       "traj_sums", "trajectories", "persona_entries", "rubrics",
                       "connections", "metadata"):
-            cur.execute(f"DELETE FROM {table} WHERE user_id=%s", (user_id,))
+            cur.execute(f"DELETE FROM layermem.{table} WHERE user_id=%s", (user_id,))
 
-        cur.executemany("INSERT INTO concepts VALUES (%s,%s,%s,%s,%s)", [
+        cur.executemany("INSERT INTO layermem.concepts VALUES (%s,%s,%s,%s,%s)", [
             (user_id, c.id, c.text, _blob(c.embedding), json.dumps(c.reflection_ids))
             for c in mem.concepts.values()
         ])
-        cur.executemany("INSERT INTO reflections VALUES (%s,%s,%s,%s,%s,%s)", [
+        cur.executemany("INSERT INTO layermem.reflections VALUES (%s,%s,%s,%s,%s,%s)", [
             (user_id, r.id, json.dumps(r.reflection_list), _blob(r.embedding),
              json.dumps(r.concept_ids), json.dumps(r.trajectory_summary_ids))
             for r in mem.reflections.values()
         ])
-        cur.executemany("INSERT INTO reflection_item_embeddings VALUES (%s,%s,%s,%s)", [
+        cur.executemany("INSERT INTO layermem.reflection_item_embeddings VALUES (%s,%s,%s,%s)", [
             (user_id, r.id, idx, _blob(e))
             for r in mem.reflections.values()
             for idx, e in enumerate(r.item_embeddings or [])
         ])
-        cur.executemany("INSERT INTO traj_sums VALUES (%s,%s,%s,%s,%s,%s)", [
+        cur.executemany("INSERT INTO layermem.traj_sums VALUES (%s,%s,%s,%s,%s,%s)", [
             (user_id, ts.id, ts.text, _blob(ts.embedding), ts.reflection_id, ts.trajectory_id)
             for ts in mem.traj_sums.values()
         ])
-        cur.executemany("INSERT INTO trajectories VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", [
+        cur.executemany("INSERT INTO layermem.trajectories VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", [
             (user_id, t.id, t.chunk_text, t.timestamp, t.source_id, t.source_type,
              t.summary_id, json.dumps(t.concept_ids))
             for t in mem.trajectories.values()
         ])
-        cur.executemany("INSERT INTO persona_entries VALUES (%s,%s,%s,%s)", [
+        cur.executemany("INSERT INTO layermem.persona_entries VALUES (%s,%s,%s,%s)", [
             (user_id, pe.name, pe.summary, _blob(pe.embedding))
             for pe in mem.persona.entries.values()
         ])
-        cur.executemany("INSERT INTO rubrics VALUES (%s,%s,%s)", [
+        cur.executemany("INSERT INTO layermem.rubrics VALUES (%s,%s,%s)", [
             (user_id, v.doc_type, v.instructions) for v in mem.rubrics.values()
         ])
 
         def _insert_conn(name: str, cm: ConnectionManager4) -> None:
-            cur.executemany("INSERT INTO connections VALUES (%s,%s,%s,%s,%s,%s,%s)", [
+            cur.executemany("INSERT INTO layermem.connections VALUES (%s,%s,%s,%s,%s,%s,%s)", [
                 (user_id, name, src, tgt, s.times_traversed, s.times_led_to_gold, int(s.newly_added))
                 for (src, tgt), s in cm.stats.items()
             ])
@@ -3097,7 +3099,7 @@ def save_to_postgres(conn_params: dict, user_id: str, mem: "ModifiedMemory") -> 
         _insert_conn("conn_c2r", mem.conn_c2r)
         _insert_conn("conn_r2s", mem.conn_r2s)
 
-        cur.executemany("INSERT INTO metadata VALUES (%s,%s,%s)", [
+        cur.executemany("INSERT INTO layermem.metadata VALUES (%s,%s,%s)", [
             (user_id, k, v) for k, v in {
                 "source_registry":      json.dumps(mem.source_registry),
                 "_docs_since_sleep":    json.dumps(mem._docs_since_sleep),
@@ -3221,65 +3223,66 @@ def load_from_sqlite(db_path: str, user_id: str) -> "ModifiedMemory":
 
 
 def load_from_postgres(conn_params: dict, user_id: str) -> "ModifiedMemory":
-    """Deserialize a ModifiedMemory instance for one user from a shared PostgreSQL database."""
+    """Deserialize a ModifiedMemory instance for one user from the layermem schema."""
     with _pg_connect(conn_params) as con:
         cur = con.cursor()
 
-        # Ensure tables exist — on first run they may not have been created yet
+        # Ensure schema and tables exist — on first run they may not have been created yet
+        cur.execute("CREATE SCHEMA IF NOT EXISTS layermem")
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS concepts (
+            CREATE TABLE IF NOT EXISTS layermem.concepts (
                 user_id TEXT, id TEXT, text TEXT, embedding BYTEA, reflection_ids TEXT,
                 PRIMARY KEY (user_id, id)
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS reflections (
+            CREATE TABLE IF NOT EXISTS layermem.reflections (
                 user_id TEXT, id TEXT, reflection_list TEXT, embedding BYTEA,
                 concept_ids TEXT, trajectory_summary_ids TEXT,
                 PRIMARY KEY (user_id, id)
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS reflection_item_embeddings (
+            CREATE TABLE IF NOT EXISTS layermem.reflection_item_embeddings (
                 user_id TEXT, reflection_id TEXT, idx INTEGER, embedding BYTEA,
                 PRIMARY KEY (user_id, reflection_id, idx)
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS traj_sums (
+            CREATE TABLE IF NOT EXISTS layermem.traj_sums (
                 user_id TEXT, id TEXT, text TEXT, embedding BYTEA,
                 reflection_id TEXT, trajectory_id TEXT,
                 PRIMARY KEY (user_id, id)
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS trajectories (
+            CREATE TABLE IF NOT EXISTS layermem.trajectories (
                 user_id TEXT, id TEXT, chunk_text TEXT, timestamp TEXT,
                 source_id TEXT, source_type TEXT, summary_id TEXT, concept_ids TEXT,
                 PRIMARY KEY (user_id, id)
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS persona_entries (
+            CREATE TABLE IF NOT EXISTS layermem.persona_entries (
                 user_id TEXT, name TEXT, summary TEXT, embedding BYTEA,
                 PRIMARY KEY (user_id, name)
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS rubrics (
+            CREATE TABLE IF NOT EXISTS layermem.rubrics (
                 user_id TEXT, doc_type TEXT, instructions TEXT,
                 PRIMARY KEY (user_id, doc_type)
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS connections (
+            CREATE TABLE IF NOT EXISTS layermem.connections (
                 user_id TEXT, table_name TEXT, src TEXT, tgt TEXT,
                 times_traversed INTEGER, times_led_to_gold INTEGER, newly_added INTEGER,
                 PRIMARY KEY (user_id, table_name, src, tgt)
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS metadata (
+            CREATE TABLE IF NOT EXISTS layermem.metadata (
                 user_id TEXT, key TEXT, value TEXT,
                 PRIMARY KEY (user_id, key)
             )
@@ -3289,7 +3292,7 @@ def load_from_postgres(conn_params: dict, user_id: str) -> "ModifiedMemory":
         mem = ModifiedMemory()
 
         cur.execute(
-            "SELECT id, text, embedding, reflection_ids FROM concepts WHERE user_id=%s",
+            "SELECT id, text, embedding, reflection_ids FROM layermem.concepts WHERE user_id=%s",
             (user_id,)
         )
         mem.concepts = {
@@ -3301,7 +3304,7 @@ def load_from_postgres(conn_params: dict, user_id: str) -> "ModifiedMemory":
         item_embs = _defaultdict(list)
         cur.execute(
             "SELECT reflection_id, idx, embedding "
-            "FROM reflection_item_embeddings WHERE user_id=%s ORDER BY reflection_id, idx",
+            "FROM layermem.reflection_item_embeddings WHERE user_id=%s ORDER BY reflection_id, idx",
             (user_id,)
         )
         for rid, _, blob in cur.fetchall():
@@ -3309,7 +3312,7 @@ def load_from_postgres(conn_params: dict, user_id: str) -> "ModifiedMemory":
 
         cur.execute(
             "SELECT id, reflection_list, embedding, concept_ids, trajectory_summary_ids "
-            "FROM reflections WHERE user_id=%s",
+            "FROM layermem.reflections WHERE user_id=%s",
             (user_id,)
         )
         mem.reflections = {
@@ -3322,7 +3325,7 @@ def load_from_postgres(conn_params: dict, user_id: str) -> "ModifiedMemory":
         }
 
         cur.execute(
-            "SELECT id, text, embedding, reflection_id, trajectory_id FROM traj_sums WHERE user_id=%s",
+            "SELECT id, text, embedding, reflection_id, trajectory_id FROM layermem.traj_sums WHERE user_id=%s",
             (user_id,)
         )
         mem.traj_sums = {
@@ -3335,7 +3338,7 @@ def load_from_postgres(conn_params: dict, user_id: str) -> "ModifiedMemory":
 
         cur.execute(
             "SELECT id, chunk_text, timestamp, source_id, source_type, summary_id, concept_ids "
-            "FROM trajectories WHERE user_id=%s",
+            "FROM layermem.trajectories WHERE user_id=%s",
             (user_id,)
         )
         mem.trajectories = {
@@ -3347,11 +3350,11 @@ def load_from_postgres(conn_params: dict, user_id: str) -> "ModifiedMemory":
             for row in cur.fetchall()
         }
 
-        cur.execute("SELECT key, value FROM metadata WHERE user_id=%s", (user_id,))
+        cur.execute("SELECT key, value FROM layermem.metadata WHERE user_id=%s", (user_id,))
         meta = dict(cur.fetchall())
 
         cur.execute(
-            "SELECT name, summary, embedding FROM persona_entries WHERE user_id=%s",
+            "SELECT name, summary, embedding FROM layermem.persona_entries WHERE user_id=%s",
             (user_id,)
         )
         mem.persona = Persona(
@@ -3363,7 +3366,7 @@ def load_from_postgres(conn_params: dict, user_id: str) -> "ModifiedMemory":
         )
 
         cur.execute(
-            "SELECT doc_type, instructions FROM rubrics WHERE user_id=%s",
+            "SELECT doc_type, instructions FROM layermem.rubrics WHERE user_id=%s",
             (user_id,)
         )
         loaded_rubrics = {
@@ -3378,7 +3381,7 @@ def load_from_postgres(conn_params: dict, user_id: str) -> "ModifiedMemory":
             cm = ConnectionManager4()
             cur.execute(
                 "SELECT src, tgt, times_traversed, times_led_to_gold, newly_added "
-                "FROM connections WHERE user_id=%s AND table_name=%s",
+                "FROM layermem.connections WHERE user_id=%s AND table_name=%s",
                 (user_id, name)
             )
             for src, tgt, tt, tlg, na in cur.fetchall():

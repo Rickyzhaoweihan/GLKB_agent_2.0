@@ -13,7 +13,6 @@ agent:
 # Output paths (relative to the repo root)
 paths:
   log_dir: "agent_logs"
-  layermem_db: "agent_logs/layermem.db"
 
 # LayerMem memory system
 memory:
