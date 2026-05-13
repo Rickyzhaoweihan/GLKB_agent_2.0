@@ -10,7 +10,6 @@ import os
 import asyncio
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
 
 from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.tools.base_toolset import BaseToolset
@@ -24,21 +23,29 @@ logger = logging.getLogger(__name__)
 # LayerMem setup
 # -----------------------------------------
 
-MEMORY_DB_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", cfg.paths.layermem_db)
-)
 _LAYERMEM_ENABLED = cfg.memory.enabled
 CONSOLIDATE_EVERY_N_FLUSHES = cfg.memory.consolidate_every_n_flushes
 AGENT_TEXT_LIMIT = cfg.memory.agent_text_limit
+
+# PostgreSQL connection parameters for LayerMem storage, read from environment.
+# Set LAYERMEM_PG_HOST, LAYERMEM_PG_PORT, LAYERMEM_PG_DB,
+# LAYERMEM_PG_USER, LAYERMEM_PG_PASSWORD in my_agent/.env
+_pg_conn_params = {
+    "host":     os.getenv("LAYERMEM_PG_HOST", "localhost"),
+    "port":     int(os.getenv("LAYERMEM_PG_PORT", "5432")),
+    "dbname":   os.getenv("LAYERMEM_PG_DB", ""),
+    "user":     os.getenv("LAYERMEM_PG_USER", ""),
+    "password": os.getenv("LAYERMEM_PG_PASSWORD", ""),
+}
 
 if _LAYERMEM_ENABLED:
     _LAYERMEM_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "layerwise_memory"))
     sys.path.insert(0, _LAYERMEM_DIR)
 
-    from agent_memory import ConversationMemory, ModifiedMemory, load_from_sqlite
+    from agent_memory import ConversationMemory, load_from_postgres
     from layermem_config import async_client as _mem_async_client, LLM_MODEL as _mem_llm_model  # type: ignore[import]
 
-    logger.info(f"LayerMem enabled (db: {MEMORY_DB_PATH})")
+    logger.info(f"LayerMem enabled (PostgreSQL: {_pg_conn_params['host']}:{_pg_conn_params['port']})")
 else:
     logger.info("LayerMem disabled (set memory.enabled: true in config.yaml to enable)")
 
@@ -49,8 +56,8 @@ _user_mems: dict = {}
 
 def _get_user_mem(user_id: str) -> "ConversationMemory":
     if user_id not in _user_mems:
-        inner = load_from_sqlite(MEMORY_DB_PATH, user_id) if os.path.exists(MEMORY_DB_PATH) else ModifiedMemory()
-        _user_mems[user_id] = ConversationMemory(inner, MEMORY_DB_PATH, user_id)
+        inner = load_from_postgres(_pg_conn_params, user_id)  # type: ignore[name-defined]
+        _user_mems[user_id] = ConversationMemory(inner, _pg_conn_params, user_id)
         logger.info(f"Loaded memory for user {user_id!r}")
     return _user_mems[user_id]
 
@@ -209,7 +216,7 @@ async def save_memory(tool_context=None) -> dict:
     await _trigger_flush(mem, session_id, wait=True)
     await mem.consolidate(n_questions_per_chunk=1)
     mem.save()
-    return {"status": "ok", "path": MEMORY_DB_PATH}
+    return {"status": "ok"}
 
 # -----------------------------------------
 # MemoryToolset

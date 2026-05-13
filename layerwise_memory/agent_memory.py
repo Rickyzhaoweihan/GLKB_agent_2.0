@@ -2833,6 +2833,8 @@ Which rubric type best fits this question? Use "general_qa" for simple factual q
 # =============================================================================
 
 import sqlite3
+import psycopg2
+from contextlib import contextmanager
 from collections import defaultdict as _defaultdict
 
 
@@ -2840,8 +2842,9 @@ def _blob(a: np.ndarray) -> bytes:
     return a.astype(np.float32).tobytes()
 
 
-def _emb(blob: bytes) -> np.ndarray:
-    return np.frombuffer(blob, dtype=np.float32).copy()
+def _emb(blob) -> np.ndarray:
+    # bytes(blob) handles both raw bytes (sqlite3) and memoryview (psycopg2 BYTEA)
+    return np.frombuffer(bytes(blob), dtype=np.float32).copy()
 
 
 def save_to_sqlite(db_path: str, user_id: str, mem: "ModifiedMemory") -> None:
@@ -2969,6 +2972,146 @@ def save_to_sqlite(db_path: str, user_id: str, mem: "ModifiedMemory") -> None:
     con.close()
 
 
+@contextmanager
+def _pg_connect(conn_params: dict):
+    """Context manager that opens a psycopg2 connection and guarantees closure.
+
+    Rolls back on exception so the connection is clean before closing.
+    """
+    con = psycopg2.connect(**conn_params)
+    try:
+        yield con
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def save_to_postgres(conn_params: dict, user_id: str, mem: "ModifiedMemory") -> None:
+    """Serialize a ModifiedMemory instance for one user into a shared PostgreSQL database."""
+    with _pg_connect(conn_params) as con:
+        cur = con.cursor()
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS concepts (
+                user_id TEXT, id TEXT, text TEXT, embedding BYTEA, reflection_ids TEXT,
+                PRIMARY KEY (user_id, id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS reflections (
+                user_id TEXT, id TEXT, reflection_list TEXT, embedding BYTEA,
+                concept_ids TEXT, trajectory_summary_ids TEXT,
+                PRIMARY KEY (user_id, id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS reflection_item_embeddings (
+                user_id TEXT, reflection_id TEXT, idx INTEGER, embedding BYTEA,
+                PRIMARY KEY (user_id, reflection_id, idx)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS traj_sums (
+                user_id TEXT, id TEXT, text TEXT, embedding BYTEA,
+                reflection_id TEXT, trajectory_id TEXT,
+                PRIMARY KEY (user_id, id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trajectories (
+                user_id TEXT, id TEXT, chunk_text TEXT, timestamp TEXT,
+                source_id TEXT, source_type TEXT, summary_id TEXT, concept_ids TEXT,
+                PRIMARY KEY (user_id, id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS persona_entries (
+                user_id TEXT, name TEXT, summary TEXT, embedding BYTEA,
+                PRIMARY KEY (user_id, name)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS rubrics (
+                user_id TEXT, doc_type TEXT, instructions TEXT,
+                PRIMARY KEY (user_id, doc_type)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS connections (
+                user_id TEXT, table_name TEXT, src TEXT, tgt TEXT,
+                times_traversed INTEGER, times_led_to_gold INTEGER, newly_added INTEGER,
+                PRIMARY KEY (user_id, table_name, src, tgt)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS metadata (
+                user_id TEXT, key TEXT, value TEXT,
+                PRIMARY KEY (user_id, key)
+            )
+        """)
+
+        for table in ("concepts", "reflections", "reflection_item_embeddings",
+                      "traj_sums", "trajectories", "persona_entries", "rubrics",
+                      "connections", "metadata"):
+            cur.execute(f"DELETE FROM {table} WHERE user_id=%s", (user_id,))
+
+        cur.executemany("INSERT INTO concepts VALUES (%s,%s,%s,%s,%s)", [
+            (user_id, c.id, c.text, _blob(c.embedding), json.dumps(c.reflection_ids))
+            for c in mem.concepts.values()
+        ])
+        cur.executemany("INSERT INTO reflections VALUES (%s,%s,%s,%s,%s,%s)", [
+            (user_id, r.id, json.dumps(r.reflection_list), _blob(r.embedding),
+             json.dumps(r.concept_ids), json.dumps(r.trajectory_summary_ids))
+            for r in mem.reflections.values()
+        ])
+        cur.executemany("INSERT INTO reflection_item_embeddings VALUES (%s,%s,%s,%s)", [
+            (user_id, r.id, idx, _blob(e))
+            for r in mem.reflections.values()
+            for idx, e in enumerate(r.item_embeddings or [])
+        ])
+        cur.executemany("INSERT INTO traj_sums VALUES (%s,%s,%s,%s,%s,%s)", [
+            (user_id, ts.id, ts.text, _blob(ts.embedding), ts.reflection_id, ts.trajectory_id)
+            for ts in mem.traj_sums.values()
+        ])
+        cur.executemany("INSERT INTO trajectories VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", [
+            (user_id, t.id, t.chunk_text, t.timestamp, t.source_id, t.source_type,
+             t.summary_id, json.dumps(t.concept_ids))
+            for t in mem.trajectories.values()
+        ])
+        cur.executemany("INSERT INTO persona_entries VALUES (%s,%s,%s,%s)", [
+            (user_id, pe.name, pe.summary, _blob(pe.embedding))
+            for pe in mem.persona.entries.values()
+        ])
+        cur.executemany("INSERT INTO rubrics VALUES (%s,%s,%s)", [
+            (user_id, v.doc_type, v.instructions) for v in mem.rubrics.values()
+        ])
+
+        def _insert_conn(name: str, cm: ConnectionManager4) -> None:
+            cur.executemany("INSERT INTO connections VALUES (%s,%s,%s,%s,%s,%s,%s)", [
+                (user_id, name, src, tgt, s.times_traversed, s.times_led_to_gold, int(s.newly_added))
+                for (src, tgt), s in cm.stats.items()
+            ])
+
+        _insert_conn("conn_c2r", mem.conn_c2r)
+        _insert_conn("conn_r2s", mem.conn_r2s)
+
+        cur.executemany("INSERT INTO metadata VALUES (%s,%s,%s)", [
+            (user_id, k, v) for k, v in {
+                "source_registry":      json.dumps(mem.source_registry),
+                "_docs_since_sleep":    json.dumps(mem._docs_since_sleep),
+                "_convs_since_sleep":   json.dumps(mem._convs_since_sleep),
+                "_trajs_since_sleep":   json.dumps(mem._trajs_since_sleep),
+                "last_sleep_stats":     json.dumps(mem.last_sleep_stats),
+                "_adapted_top_k":       json.dumps(mem._adapted_top_k),
+                "persona_last_updated": mem.persona.last_updated,
+            }.items()
+        ])
+
+        con.commit()
+
+
 def load_from_sqlite(db_path: str, user_id: str) -> "ModifiedMemory":
     """Deserialize a ModifiedMemory instance for one user from a shared SQLite file."""
     con = sqlite3.connect(db_path)
@@ -3077,6 +3220,187 @@ def load_from_sqlite(db_path: str, user_id: str) -> "ModifiedMemory":
     return mem
 
 
+def load_from_postgres(conn_params: dict, user_id: str) -> "ModifiedMemory":
+    """Deserialize a ModifiedMemory instance for one user from a shared PostgreSQL database."""
+    with _pg_connect(conn_params) as con:
+        cur = con.cursor()
+
+        # Ensure tables exist — on first run they may not have been created yet
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS concepts (
+                user_id TEXT, id TEXT, text TEXT, embedding BYTEA, reflection_ids TEXT,
+                PRIMARY KEY (user_id, id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS reflections (
+                user_id TEXT, id TEXT, reflection_list TEXT, embedding BYTEA,
+                concept_ids TEXT, trajectory_summary_ids TEXT,
+                PRIMARY KEY (user_id, id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS reflection_item_embeddings (
+                user_id TEXT, reflection_id TEXT, idx INTEGER, embedding BYTEA,
+                PRIMARY KEY (user_id, reflection_id, idx)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS traj_sums (
+                user_id TEXT, id TEXT, text TEXT, embedding BYTEA,
+                reflection_id TEXT, trajectory_id TEXT,
+                PRIMARY KEY (user_id, id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS trajectories (
+                user_id TEXT, id TEXT, chunk_text TEXT, timestamp TEXT,
+                source_id TEXT, source_type TEXT, summary_id TEXT, concept_ids TEXT,
+                PRIMARY KEY (user_id, id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS persona_entries (
+                user_id TEXT, name TEXT, summary TEXT, embedding BYTEA,
+                PRIMARY KEY (user_id, name)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS rubrics (
+                user_id TEXT, doc_type TEXT, instructions TEXT,
+                PRIMARY KEY (user_id, doc_type)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS connections (
+                user_id TEXT, table_name TEXT, src TEXT, tgt TEXT,
+                times_traversed INTEGER, times_led_to_gold INTEGER, newly_added INTEGER,
+                PRIMARY KEY (user_id, table_name, src, tgt)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS metadata (
+                user_id TEXT, key TEXT, value TEXT,
+                PRIMARY KEY (user_id, key)
+            )
+        """)
+        con.commit()
+
+        mem = ModifiedMemory()
+
+        cur.execute(
+            "SELECT id, text, embedding, reflection_ids FROM concepts WHERE user_id=%s",
+            (user_id,)
+        )
+        mem.concepts = {
+            row[0]: Concept4(id=row[0], text=row[1], embedding=_emb(row[2]),
+                             reflection_ids=json.loads(row[3]))
+            for row in cur.fetchall()
+        }
+
+        item_embs = _defaultdict(list)
+        cur.execute(
+            "SELECT reflection_id, idx, embedding "
+            "FROM reflection_item_embeddings WHERE user_id=%s ORDER BY reflection_id, idx",
+            (user_id,)
+        )
+        for rid, _, blob in cur.fetchall():
+            item_embs[rid].append(_emb(blob))
+
+        cur.execute(
+            "SELECT id, reflection_list, embedding, concept_ids, trajectory_summary_ids "
+            "FROM reflections WHERE user_id=%s",
+            (user_id,)
+        )
+        mem.reflections = {
+            row[0]: Reflection4(
+                id=row[0], reflection_list=json.loads(row[1]), embedding=_emb(row[2]),
+                concept_ids=json.loads(row[3]), trajectory_summary_ids=json.loads(row[4]),
+                item_embeddings=item_embs.get(row[0], []),
+            )
+            for row in cur.fetchall()
+        }
+
+        cur.execute(
+            "SELECT id, text, embedding, reflection_id, trajectory_id FROM traj_sums WHERE user_id=%s",
+            (user_id,)
+        )
+        mem.traj_sums = {
+            row[0]: TrajectorySummary4(
+                id=row[0], text=row[1], embedding=_emb(row[2]),
+                reflection_id=row[3], trajectory_id=row[4],
+            )
+            for row in cur.fetchall()
+        }
+
+        cur.execute(
+            "SELECT id, chunk_text, timestamp, source_id, source_type, summary_id, concept_ids "
+            "FROM trajectories WHERE user_id=%s",
+            (user_id,)
+        )
+        mem.trajectories = {
+            row[0]: Trajectory4(
+                id=row[0], chunk_text=row[1], timestamp=row[2],
+                source_id=row[3], source_type=row[4],
+                summary_id=row[5], concept_ids=json.loads(row[6]),
+            )
+            for row in cur.fetchall()
+        }
+
+        cur.execute("SELECT key, value FROM metadata WHERE user_id=%s", (user_id,))
+        meta = dict(cur.fetchall())
+
+        cur.execute(
+            "SELECT name, summary, embedding FROM persona_entries WHERE user_id=%s",
+            (user_id,)
+        )
+        mem.persona = Persona(
+            entries={
+                row[0]: PersonaEntry(name=row[0], summary=row[1], embedding=_emb(row[2]))
+                for row in cur.fetchall()
+            },
+            last_updated=meta.get("persona_last_updated", ""),
+        )
+
+        cur.execute(
+            "SELECT doc_type, instructions FROM rubrics WHERE user_id=%s",
+            (user_id,)
+        )
+        loaded_rubrics = {
+            row[0]: TaskRubric(doc_type=row[0], instructions=row[1])
+            for row in cur.fetchall()
+        }
+        # Only overwrite if rows exist — preserves the default general_qa rubric for new users
+        if loaded_rubrics:
+            mem.rubrics = loaded_rubrics
+
+        def _load_conn(name: str) -> ConnectionManager4:
+            cm = ConnectionManager4()
+            cur.execute(
+                "SELECT src, tgt, times_traversed, times_led_to_gold, newly_added "
+                "FROM connections WHERE user_id=%s AND table_name=%s",
+                (user_id, name)
+            )
+            for src, tgt, tt, tlg, na in cur.fetchall():
+                cm.connections[src].add(tgt)
+                cm.stats[(src, tgt)] = ConnStats(
+                    times_traversed=tt, times_led_to_gold=tlg, newly_added=bool(na),
+                )
+            return cm
+
+        mem.conn_c2r = _load_conn("conn_c2r")
+        mem.conn_r2s = _load_conn("conn_r2s")
+
+        mem.source_registry    = json.loads(meta.get("source_registry", "{}"))
+        mem._docs_since_sleep  = json.loads(meta.get("_docs_since_sleep", "[]"))
+        mem._convs_since_sleep = json.loads(meta.get("_convs_since_sleep", "[]"))
+        mem._trajs_since_sleep = json.loads(meta.get("_trajs_since_sleep", "[]"))
+        mem.last_sleep_stats   = json.loads(meta.get("last_sleep_stats", "{}"))
+        mem._adapted_top_k     = json.loads(meta.get("_adapted_top_k", "5"))
+
+        return mem
+
+
 # =============================================================================
 # ConversationMemory — agent-facing API
 # =============================================================================
@@ -3104,9 +3428,9 @@ class ConversationMemory:
         await mem.close()
     """
 
-    def __init__(self, mem: ModifiedMemory, db_path: str, user_id: str) -> None:
+    def __init__(self, mem: ModifiedMemory, conn_params: dict, user_id: str) -> None:
         self._mem = mem
-        self._db_path = db_path
+        self._conn_params = conn_params
         self._user_id = user_id
         self._flush_count: int = 0
         self._turn_buffers = _defaultdict(list)
@@ -3114,16 +3438,13 @@ class ConversationMemory:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     @classmethod
-    async def create(cls, db_path: str = "agent_memory.db", user_id: str = "default") -> "ConversationMemory":
-        """Load from db_path if it exists, otherwise start fresh."""
-        if os.path.exists(db_path):
-            mem = load_from_sqlite(db_path, user_id)
-        else:
-            mem = ModifiedMemory()
-        return cls(mem, db_path, user_id)
+    async def create(cls, conn_params: dict, user_id: str = "default") -> "ConversationMemory":
+        """Load existing memory for user from PostgreSQL, or start fresh."""
+        mem = load_from_postgres(conn_params, user_id)
+        return cls(mem, conn_params, user_id)
 
     def save(self) -> None:
-        save_to_sqlite(self._db_path, self._user_id, self._mem)
+        save_to_postgres(self._conn_params, self._user_id, self._mem)
 
     async def close(self) -> None:
         self.save()
