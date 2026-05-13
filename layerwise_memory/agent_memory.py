@@ -2844,105 +2844,133 @@ def _emb(blob: bytes) -> np.ndarray:
     return np.frombuffer(blob, dtype=np.float32).copy()
 
 
-def save_to_sqlite(db_path: str, mem: "ModifiedMemory") -> None:
-    """Serialize a ModifiedMemory instance to a SQLite file (overwrites if exists)."""
-    if os.path.exists(db_path):
-        os.remove(db_path)
-
+def save_to_sqlite(db_path: str, user_id: str, mem: "ModifiedMemory") -> None:
+    """Serialize a ModifiedMemory instance for one user into a shared SQLite file."""
     con = sqlite3.connect(db_path)
     cur = con.cursor()
-    cur.executescript("""
-        CREATE TABLE concepts (
-            id TEXT PRIMARY KEY, text TEXT, embedding BLOB, reflection_ids TEXT
-        );
-        CREATE TABLE reflections (
-            id TEXT PRIMARY KEY, reflection_list TEXT, embedding BLOB,
-            concept_ids TEXT, trajectory_summary_ids TEXT
-        );
-        CREATE TABLE reflection_item_embeddings (
-            reflection_id TEXT, idx INTEGER, embedding BLOB,
-            PRIMARY KEY (reflection_id, idx)
-        );
-        CREATE TABLE traj_sums (
-            id TEXT PRIMARY KEY, text TEXT, embedding BLOB,
-            reflection_id TEXT, trajectory_id TEXT
-        );
-        CREATE TABLE trajectories (
-            id TEXT PRIMARY KEY, chunk_text TEXT, timestamp TEXT,
-            source_id TEXT, source_type TEXT, summary_id TEXT, concept_ids TEXT
-        );
-        CREATE TABLE persona_entries (
-            name TEXT PRIMARY KEY, summary TEXT, embedding BLOB
-        );
-        CREATE TABLE rubrics (
-            doc_type TEXT PRIMARY KEY, instructions TEXT
-        );
-        CREATE TABLE connections (
-            table_name TEXT, src TEXT, tgt TEXT,
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS concepts (
+            user_id TEXT, id TEXT, text TEXT, embedding BLOB, reflection_ids TEXT,
+            PRIMARY KEY (user_id, id)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS reflections (
+            user_id TEXT, id TEXT, reflection_list TEXT, embedding BLOB,
+            concept_ids TEXT, trajectory_summary_ids TEXT,
+            PRIMARY KEY (user_id, id)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS reflection_item_embeddings (
+            user_id TEXT, reflection_id TEXT, idx INTEGER, embedding BLOB,
+            PRIMARY KEY (user_id, reflection_id, idx)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS traj_sums (
+            user_id TEXT, id TEXT, text TEXT, embedding BLOB,
+            reflection_id TEXT, trajectory_id TEXT,
+            PRIMARY KEY (user_id, id)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS trajectories (
+            user_id TEXT, id TEXT, chunk_text TEXT, timestamp TEXT,
+            source_id TEXT, source_type TEXT, summary_id TEXT, concept_ids TEXT,
+            PRIMARY KEY (user_id, id)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS persona_entries (
+            user_id TEXT, name TEXT, summary TEXT, embedding BLOB,
+            PRIMARY KEY (user_id, name)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS rubrics (
+            user_id TEXT, doc_type TEXT, instructions TEXT,
+            PRIMARY KEY (user_id, doc_type)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS connections (
+            user_id TEXT, table_name TEXT, src TEXT, tgt TEXT,
             times_traversed INTEGER, times_led_to_gold INTEGER, newly_added INTEGER,
-            PRIMARY KEY (table_name, src, tgt)
-        );
-        CREATE TABLE metadata (
-            key TEXT PRIMARY KEY, value TEXT
-        );
+            PRIMARY KEY (user_id, table_name, src, tgt)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS metadata (
+            user_id TEXT, key TEXT, value TEXT,
+            PRIMARY KEY (user_id, key)
+        )
     """)
 
-    cur.executemany("INSERT INTO concepts VALUES (?,?,?,?)", [
-        (c.id, c.text, _blob(c.embedding), json.dumps(c.reflection_ids))
+    for table in ("concepts", "reflections", "reflection_item_embeddings",
+                  "traj_sums", "trajectories", "persona_entries", "rubrics",
+                  "connections", "metadata"):
+        cur.execute(f"DELETE FROM {table} WHERE user_id=?", (user_id,))
+
+    cur.executemany("INSERT INTO concepts VALUES (?,?,?,?,?)", [
+        (user_id, c.id, c.text, _blob(c.embedding), json.dumps(c.reflection_ids))
         for c in mem.concepts.values()
     ])
-    cur.executemany("INSERT INTO reflections VALUES (?,?,?,?,?)", [
-        (r.id, json.dumps(r.reflection_list), _blob(r.embedding),
+    cur.executemany("INSERT INTO reflections VALUES (?,?,?,?,?,?)", [
+        (user_id, r.id, json.dumps(r.reflection_list), _blob(r.embedding),
          json.dumps(r.concept_ids), json.dumps(r.trajectory_summary_ids))
         for r in mem.reflections.values()
     ])
-    cur.executemany("INSERT INTO reflection_item_embeddings VALUES (?,?,?)", [
-        (r.id, idx, _blob(e))
+    cur.executemany("INSERT INTO reflection_item_embeddings VALUES (?,?,?,?)", [
+        (user_id, r.id, idx, _blob(e))
         for r in mem.reflections.values()
         for idx, e in enumerate(r.item_embeddings or [])
     ])
-    cur.executemany("INSERT INTO traj_sums VALUES (?,?,?,?,?)", [
-        (ts.id, ts.text, _blob(ts.embedding), ts.reflection_id, ts.trajectory_id)
+    cur.executemany("INSERT INTO traj_sums VALUES (?,?,?,?,?,?)", [
+        (user_id, ts.id, ts.text, _blob(ts.embedding), ts.reflection_id, ts.trajectory_id)
         for ts in mem.traj_sums.values()
     ])
-    cur.executemany("INSERT INTO trajectories VALUES (?,?,?,?,?,?,?)", [
-        (t.id, t.chunk_text, t.timestamp, t.source_id, t.source_type,
+    cur.executemany("INSERT INTO trajectories VALUES (?,?,?,?,?,?,?,?)", [
+        (user_id, t.id, t.chunk_text, t.timestamp, t.source_id, t.source_type,
          t.summary_id, json.dumps(t.concept_ids))
         for t in mem.trajectories.values()
     ])
-    cur.executemany("INSERT INTO persona_entries VALUES (?,?,?)", [
-        (pe.name, pe.summary, _blob(pe.embedding))
+    cur.executemany("INSERT INTO persona_entries VALUES (?,?,?,?)", [
+        (user_id, pe.name, pe.summary, _blob(pe.embedding))
         for pe in mem.persona.entries.values()
     ])
-    cur.executemany("INSERT INTO rubrics VALUES (?,?)", [
-        (v.doc_type, v.instructions) for v in mem.rubrics.values()
+    cur.executemany("INSERT INTO rubrics VALUES (?,?,?)", [
+        (user_id, v.doc_type, v.instructions) for v in mem.rubrics.values()
     ])
 
     def _insert_conn(name: str, cm: ConnectionManager4) -> None:
-        cur.executemany("INSERT INTO connections VALUES (?,?,?,?,?,?)", [
-            (name, src, tgt, s.times_traversed, s.times_led_to_gold, int(s.newly_added))
+        cur.executemany("INSERT INTO connections VALUES (?,?,?,?,?,?,?)", [
+            (user_id, name, src, tgt, s.times_traversed, s.times_led_to_gold, int(s.newly_added))
             for (src, tgt), s in cm.stats.items()
         ])
 
     _insert_conn("conn_c2r", mem.conn_c2r)
     _insert_conn("conn_r2s", mem.conn_r2s)
 
-    cur.executemany("INSERT INTO metadata VALUES (?,?)", {
-        "source_registry":      json.dumps(mem.source_registry),
-        "_docs_since_sleep":    json.dumps(mem._docs_since_sleep),
-        "_convs_since_sleep":   json.dumps(mem._convs_since_sleep),
-        "_trajs_since_sleep":   json.dumps(mem._trajs_since_sleep),
-        "last_sleep_stats":     json.dumps(mem.last_sleep_stats),
-        "_adapted_top_k":       json.dumps(mem._adapted_top_k),
-        "persona_last_updated": mem.persona.last_updated,
-    }.items())
+    cur.executemany("INSERT INTO metadata VALUES (?,?,?)", [
+        (user_id, k, v) for k, v in {
+            "source_registry":      json.dumps(mem.source_registry),
+            "_docs_since_sleep":    json.dumps(mem._docs_since_sleep),
+            "_convs_since_sleep":   json.dumps(mem._convs_since_sleep),
+            "_trajs_since_sleep":   json.dumps(mem._trajs_since_sleep),
+            "last_sleep_stats":     json.dumps(mem.last_sleep_stats),
+            "_adapted_top_k":       json.dumps(mem._adapted_top_k),
+            "persona_last_updated": mem.persona.last_updated,
+        }.items()
+    ])
 
     con.commit()
     con.close()
 
 
-def load_from_sqlite(db_path: str) -> "ModifiedMemory":
-    """Deserialize a ModifiedMemory instance from a SQLite file."""
+def load_from_sqlite(db_path: str, user_id: str) -> "ModifiedMemory":
+    """Deserialize a ModifiedMemory instance for one user from a shared SQLite file."""
     con = sqlite3.connect(db_path)
     cur = con.cursor()
     mem = ModifiedMemory()
@@ -2950,13 +2978,17 @@ def load_from_sqlite(db_path: str) -> "ModifiedMemory":
     mem.concepts = {
         row[0]: Concept4(id=row[0], text=row[1], embedding=_emb(row[2]),
                          reflection_ids=json.loads(row[3]))
-        for row in cur.execute("SELECT id, text, embedding, reflection_ids FROM concepts")
+        for row in cur.execute(
+            "SELECT id, text, embedding, reflection_ids FROM concepts WHERE user_id=?",
+            (user_id,)
+        )
     }
 
     item_embs = _defaultdict(list)
     for rid, idx, blob in cur.execute(
         "SELECT reflection_id, idx, embedding "
-        "FROM reflection_item_embeddings ORDER BY reflection_id, idx"
+        "FROM reflection_item_embeddings WHERE user_id=? ORDER BY reflection_id, idx",
+        (user_id,)
     ):
         item_embs[rid].append(_emb(blob))
 
@@ -2968,7 +3000,8 @@ def load_from_sqlite(db_path: str) -> "ModifiedMemory":
         )
         for row in cur.execute(
             "SELECT id, reflection_list, embedding, concept_ids, trajectory_summary_ids "
-            "FROM reflections"
+            "FROM reflections WHERE user_id=?",
+            (user_id,)
         )
     }
 
@@ -2978,7 +3011,8 @@ def load_from_sqlite(db_path: str) -> "ModifiedMemory":
             reflection_id=row[3], trajectory_id=row[4],
         )
         for row in cur.execute(
-            "SELECT id, text, embedding, reflection_id, trajectory_id FROM traj_sums"
+            "SELECT id, text, embedding, reflection_id, trajectory_id FROM traj_sums WHERE user_id=?",
+            (user_id,)
         )
     }
 
@@ -2990,30 +3024,38 @@ def load_from_sqlite(db_path: str) -> "ModifiedMemory":
         )
         for row in cur.execute(
             "SELECT id, chunk_text, timestamp, source_id, source_type, summary_id, concept_ids "
-            "FROM trajectories"
+            "FROM trajectories WHERE user_id=?",
+            (user_id,)
         )
     }
 
-    meta = dict(cur.execute("SELECT key, value FROM metadata").fetchall())
+    meta = dict(cur.execute(
+        "SELECT key, value FROM metadata WHERE user_id=?", (user_id,)
+    ).fetchall())
 
     mem.persona = Persona(
         entries={
             row[0]: PersonaEntry(name=row[0], summary=row[1], embedding=_emb(row[2]))
-            for row in cur.execute("SELECT name, summary, embedding FROM persona_entries")
+            for row in cur.execute(
+                "SELECT name, summary, embedding FROM persona_entries WHERE user_id=?",
+                (user_id,)
+            )
         },
         last_updated=meta.get("persona_last_updated", ""),
     )
 
     mem.rubrics = {
         row[0]: TaskRubric(doc_type=row[0], instructions=row[1])
-        for row in cur.execute("SELECT doc_type, instructions FROM rubrics")
+        for row in cur.execute(
+            "SELECT doc_type, instructions FROM rubrics WHERE user_id=?", (user_id,)
+        )
     }
 
     def _load_conn(name: str) -> ConnectionManager4:
         cm = ConnectionManager4()
         for src, tgt, tt, tlg, na in cur.execute(
             "SELECT src, tgt, times_traversed, times_led_to_gold, newly_added "
-            "FROM connections WHERE table_name=?", (name,)
+            "FROM connections WHERE user_id=? AND table_name=?", (user_id, name)
         ):
             cm.connections[src].add(tgt)
             cm.stats[(src, tgt)] = ConnStats(
@@ -3062,24 +3104,26 @@ class ConversationMemory:
         await mem.close()
     """
 
-    def __init__(self, mem: ModifiedMemory, db_path: str) -> None:
+    def __init__(self, mem: ModifiedMemory, db_path: str, user_id: str) -> None:
         self._mem = mem
         self._db_path = db_path
+        self._user_id = user_id
+        self._flush_count: int = 0
         self._turn_buffers = _defaultdict(list)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     @classmethod
-    async def create(cls, db_path: str = "agent_memory.db") -> "ConversationMemory":
+    async def create(cls, db_path: str = "agent_memory.db", user_id: str = "default") -> "ConversationMemory":
         """Load from db_path if it exists, otherwise start fresh."""
         if os.path.exists(db_path):
-            mem = load_from_sqlite(db_path)
+            mem = load_from_sqlite(db_path, user_id)
         else:
             mem = ModifiedMemory()
-        return cls(mem, db_path)
+        return cls(mem, db_path, user_id)
 
     def save(self) -> None:
-        save_to_sqlite(self._db_path, self._mem)
+        save_to_sqlite(self._db_path, self._user_id, self._mem)
 
     async def close(self) -> None:
         self.save()

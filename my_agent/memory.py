@@ -31,10 +31,6 @@ _LAYERMEM_ENABLED = cfg.memory.enabled
 CONSOLIDATE_EVERY_N_FLUSHES = cfg.memory.consolidate_every_n_flushes
 AGENT_TEXT_LIMIT = cfg.memory.agent_text_limit
 
-mem = None
-_session_id = f"session_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H-%M-%S')}"
-_flush_count: int = 0
-
 if _LAYERMEM_ENABLED:
     _LAYERMEM_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "layerwise_memory"))
     sys.path.insert(0, _LAYERMEM_DIR)
@@ -42,11 +38,22 @@ if _LAYERMEM_ENABLED:
     from agent_memory import ConversationMemory, ModifiedMemory, load_from_sqlite
     from layermem_config import async_client as _mem_async_client, LLM_MODEL as _mem_llm_model  # type: ignore[import]
 
-    _mem_inner = load_from_sqlite(MEMORY_DB_PATH) if os.path.exists(MEMORY_DB_PATH) else ModifiedMemory()
-    mem = ConversationMemory(_mem_inner, MEMORY_DB_PATH)
     logger.info(f"LayerMem enabled (db: {MEMORY_DB_PATH})")
 else:
     logger.info("LayerMem disabled (set memory.enabled: true in config.yaml to enable)")
+
+# Per-user ConversationMemory instances, keyed by user_id.
+# Loaded lazily on first request; persist for the lifetime of the server process.
+_user_mems: dict = {}
+
+
+def _get_user_mem(user_id: str) -> "ConversationMemory":
+    if user_id not in _user_mems:
+        inner = load_from_sqlite(MEMORY_DB_PATH, user_id) if os.path.exists(MEMORY_DB_PATH) else ModifiedMemory()
+        _user_mems[user_id] = ConversationMemory(inner, MEMORY_DB_PATH, user_id)
+        logger.info(f"Loaded memory for user {user_id!r}")
+    return _user_mems[user_id]
+
 
 # -----------------------------------------
 # Episode boundary detection helpers
@@ -92,44 +99,42 @@ async def _is_boundary(buffer_lines: list) -> bool:
         return False
 
 
-async def _flush_keep_last_turn() -> None:
+async def _flush_keep_last_turn(mem: "ConversationMemory", session_id: str) -> None:
     """Flush all turns except the most recent into an episode; latest turn seeds the new episode."""
-    global _flush_count
-    all_lines = list(mem._turn_buffers.get(_session_id, []))  # type: ignore[union-attr]
+    all_lines = list(mem._turn_buffers.get(session_id, []))
     if len(all_lines) < 4:
         return
     to_flush = all_lines[:-2]
-    mem._turn_buffers[_session_id] = all_lines[-2:]  # type: ignore[union-attr]
+    mem._turn_buffers[session_id] = all_lines[-2:]
     content = "\n".join(to_flush)
     timestamp = datetime.now(timezone.utc).isoformat()
-    _flush_count += 1
-    source_id = f"{_session_id}_part{_flush_count}"
-    ingestion = mem._mem.add_content_async(content, source_id, "conversation", timestamp, False)
-    asyncio.create_task(ingestion)
-    if _flush_count % CONSOLIDATE_EVERY_N_FLUSHES == 0:
-        asyncio.create_task(mem.consolidate())
+    mem._flush_count += 1
+    source_id = f"{session_id}_part{mem._flush_count}"
+    # Await ingestion so concepts/embeddings are in ModifiedMemory before mem.save() is called
+    await mem._mem.add_content_async(content, source_id, "conversation", timestamp, False)
+    if mem._flush_count % CONSOLIDATE_EVERY_N_FLUSHES == 0:
+        asyncio.create_task(mem.consolidate())  # consolidation stays background — expensive
 
 
-async def _trigger_flush(wait: bool = False, consolidate: bool = True) -> None:
+async def _trigger_flush(mem: "ConversationMemory", session_id: str, wait: bool = False, consolidate: bool = True) -> None:
     """Pop the turn buffer and ingest. Background by default; await if wait=True.
 
     consolidate=False skips the periodic sleep_update — use this on shutdown
     to avoid spawning a long-running task that may be killed mid-consolidation.
     """
-    global _flush_count
-    lines = mem._turn_buffers.pop(_session_id, [])  # type: ignore[union-attr]
+    lines = mem._turn_buffers.pop(session_id, [])
     if not lines:
         return
     content = "\n".join(lines)
     timestamp = datetime.now(timezone.utc).isoformat()
-    _flush_count += 1
-    source_id = f"{_session_id}_part{_flush_count}"
+    mem._flush_count += 1
+    source_id = f"{session_id}_part{mem._flush_count}"
     ingestion = mem._mem.add_content_async(content, source_id, "conversation", timestamp, False)
     if wait:
         await ingestion
     else:
         asyncio.create_task(ingestion)
-    if consolidate and _flush_count % CONSOLIDATE_EVERY_N_FLUSHES == 0:
+    if consolidate and mem._flush_count % CONSOLIDATE_EVERY_N_FLUSHES == 0:
         asyncio.create_task(mem.consolidate())
 
 # -----------------------------------------
@@ -138,8 +143,13 @@ async def _trigger_flush(wait: bool = False, consolidate: bool = True) -> None:
 
 async def _memory_after_agent_callback(callback_context) -> None:
     """Auto-buffer each turn; flush to LayerMem when the memory LLM detects a topic shift."""
-    if not _LAYERMEM_ENABLED or mem is None:
+    if not _LAYERMEM_ENABLED:
         return None
+
+    user_id = callback_context.session.user_id
+    session_id = callback_context.session.id
+
+    mem = _get_user_mem(user_id)
 
     user_text = ""
     if callback_context.user_content:
@@ -160,16 +170,17 @@ async def _memory_after_agent_callback(callback_context) -> None:
         return None
 
     if user_text:
-        mem.add_turn("User", user_text, session_id=_session_id)
+        mem.add_turn("User", user_text, session_id=session_id)
     if agent_text:
-        mem.add_turn("GLKBAgent", agent_text, session_id=_session_id)
+        mem.add_turn("GLKBAgent", agent_text, session_id=session_id)
 
     logger.debug(f"Memory buffer | user={len(user_text)}chars agent={len(agent_text)}chars")
 
-    buffer_lines = mem._turn_buffers.get(_session_id, [])  # type: ignore[union-attr]
+    buffer_lines = mem._turn_buffers.get(session_id, [])
     if len(buffer_lines) >= 4 and await _is_boundary(buffer_lines):
         logger.info("Episode boundary detected — flushing buffer, keeping latest turn")
-        await _flush_keep_last_turn()
+        await _flush_keep_last_turn(mem, session_id)
+        mem.save()
 
     return None
 
@@ -177,19 +188,25 @@ async def _memory_after_agent_callback(callback_context) -> None:
 # Agent-callable memory tools
 # -----------------------------------------
 
-async def query_memory(question: str) -> dict:
+async def query_memory(question: str, tool_context=None) -> dict:
     """Query long-term memory for relevant context from past sessions."""
     if not _LAYERMEM_ENABLED:
         return {"answer": "Memory is disabled. Set memory.enabled: true in config.yaml to enable."}
+    # tool_context is injected by ADK; user_id is a direct attribute on Context
+    user_id = tool_context.user_id  # type: ignore[union-attr]
+    mem = _get_user_mem(user_id)
     answer = await mem.answer(question)
     return {"answer": answer}
 
 
-async def save_memory() -> dict:
+async def save_memory(tool_context=None) -> dict:
     """Flush current buffer, consolidate memory, and persist to disk."""
     if not _LAYERMEM_ENABLED:
         return {"status": "disabled"}
-    await _trigger_flush(wait=True)
+    user_id = tool_context.user_id  # type: ignore[union-attr]
+    session_id = tool_context.session.id
+    mem = _get_user_mem(user_id)
+    await _trigger_flush(mem, session_id, wait=True)
     await mem.consolidate(n_questions_per_chunk=1)
     mem.save()
     return {"status": "ok", "path": MEMORY_DB_PATH}
@@ -199,14 +216,16 @@ async def save_memory() -> dict:
 # -----------------------------------------
 
 class MemoryToolset(BaseToolset):
-    """Exposes memory tools and flushes + saves on runner shutdown."""
+    """Exposes memory tools and flushes + saves all users on runner shutdown."""
 
     async def get_tools(self, readonly_context: ReadonlyContext = None) -> list:
         return [FunctionTool(query_memory), FunctionTool(save_memory)]
 
     async def close(self) -> None:
-        if not _LAYERMEM_ENABLED or mem is None:
+        if not _LAYERMEM_ENABLED:
             return
-        await _trigger_flush(wait=True, consolidate=False)
-        mem.save()
-        logger.info("Memory flushed and saved on runner close.")
+        for user_id, mem in list(_user_mems.items()):
+            for session_id in list(mem._turn_buffers.keys()):
+                await _trigger_flush(mem, session_id, wait=True, consolidate=False)
+            mem.save()
+            logger.info(f"Memory flushed and saved for user {user_id!r} on runner close.")
