@@ -21,6 +21,7 @@ When retrieving articles, consider the full conversation context, especially if 
 **Primary search — Use `article_search` (GLKB) first:**
 - Searches the GLKB Neo4j index with pre-computed impact scores and journal impact factors.
 - Best for finding high-impact, well-established literature already indexed in GLKB.
+- For search mode or high-ranking paper requests, call `article_search` with `mode="high_impact"` first to prioritize impactful papers by title relevance, citation count, and journal impact factor.
 
 **Supplementary search — Use `search_pubmed` (NCBI) when:**
 - GLKB results are insufficient or too few.

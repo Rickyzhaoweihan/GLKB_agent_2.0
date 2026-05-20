@@ -27,7 +27,7 @@ import re
 import time
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Literal
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request, status
@@ -752,6 +752,7 @@ def _build_trajectory(events: list) -> list:
 class StreamRequest(BaseModel):
     """Request body for the /stream endpoint."""
     question: str = Field(..., description="The user's question")
+    mode: Optional[Literal["none", "high_impact"]] = Field(default="none", description="Optional mode: none or high_impact")
     messages: Optional[List[Dict]] = Field(default=[], description="List of messages in the conversation")
     max_articles: int = Field(default=30, description="Maximum number of articles to return")
     session_id: Optional[str] = Field(default=None, description="Session ID")
@@ -772,6 +773,13 @@ async def stream_process(request: StreamRequest):
     """
     try:
         question = request.question
+        if request.mode == "high_impact":
+            question = (
+                "Mode: high_impact. Prioritize high-impact biomedical papers. "
+                "Use GLKB article_search with mode='high_impact' first. "
+                "Rank papers by title relevance, citation count, and journal impact factor before using broader PubMed search.\n\n"
+                f"User question: {question}"
+            )
         step_start_time = time.time()
         logger.info(f"[STREAM REQUEST] question={question!r} session_id={request.session_id}")
 

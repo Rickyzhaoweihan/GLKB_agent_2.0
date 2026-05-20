@@ -66,6 +66,23 @@ CYPHER_QUERY_TIMEOUT = 30  # seconds — kill queries that take longer than this
 CYPHER_MAX_ROWS = 500      # hard cap on returned rows
 CYPHER_DEFAULT_LIMIT = 50  # injected when query has no LIMIT clause
 
+def _article_search_order_by(
+    prioritize_recent: bool = False,
+    mode: str = "none",
+) -> str:
+    """Build article search ordering for impact-first or recent-first results."""
+    impact_order = "order by log(1+5*score) + log(1+a.n_citation) + 0.5*j.impact_factor*exp(-0.15*date().year-a.pubdate) desc"
+    if mode == "high_impact":
+        return impact_order
+    if prioritize_recent:
+        return """ORDER BY 
+    log(1 + 5 * score) +
+    log(1 + a.n_citation) * exp(-0.05 * (date().year - a.pubdate)) +
+    (0.5 * j.impact_factor) * exp(-0.20 * (date().year - a.pubdate)) +
+    2.0 * exp(-0.10 * (date().year - a.pubdate))
+DESC"""
+    return impact_order
+
 def _has_limit(query: str) -> bool:
     """Check if a Cypher query already contains a LIMIT clause."""
     # Strip string literals to avoid false positives
@@ -170,7 +187,8 @@ async def article_search(
     keywords: Optional[List[str]] = None,
     pubmed_ids: Optional[List[str]] = None,
     limit: int = 20,
-    prioritize_recent: bool = False
+    prioritize_recent: bool = False,
+    mode: str = "none",
 ) -> dict:
     """
     Search for PubMed articles in the GLKB Neo4j knowledge graph using keywords or PubMed IDs.
@@ -180,6 +198,7 @@ async def article_search(
         pubmed_ids: a list of PubMed IDs to search for
         limit: Maximum number of results to return (default: 10)
         prioritize_recent: Whether to prioritize recent articles or to prioritize impactful articles. If True, recent articles will be prioritized. If False, impactful articles will be prioritized. Default is False.
+        mode: Optional search mode. Use "high_impact" to explicitly prioritize high-impact papers. Default is "none".
     Returns:
         dict: Contains search results or error information
             - success: bool indicating if search was successful
@@ -194,15 +213,7 @@ async def article_search(
                 "error": "Both keywords and PubMed IDs provided, please provide only one"
             }
         if keywords:
-            if prioritize_recent:
-                order_by = """ORDER BY 
-    log(1 + 5 * score) +
-    log(1 + a.n_citation) * exp(-0.05 * (date().year - a.pubdate)) +
-    (0.5 * j.impact_factor) * exp(-0.20 * (date().year - a.pubdate)) +
-    2.0 * exp(-0.10 * (date().year - a.pubdate))
-DESC"""
-            else:
-                order_by = "order by log(1+5*score) + log(1+a.n_citation) + 0.5*j.impact_factor*exp(-0.15*date().year-a.pubdate) desc"
+            order_by = _article_search_order_by(prioritize_recent, mode)
             # Build the Cypher query
             query = f"""
             CALL db.index.fulltext.queryNodes("article_Title", $keywords) YIELD node, score WITH node as a, score LIMIT 100
@@ -216,6 +227,7 @@ DESC"""
             return {
                 "success": True,
                 "keywords": keywords,
+                "mode": mode,
                 "count": len(results),
                 "results": results
             }
@@ -644,4 +656,3 @@ pubmed_tools = [
     get_citing_articles_tool,
     comprehensive_report_tool,
 ]
-
