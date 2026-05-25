@@ -49,9 +49,11 @@ from .models import (
     SessionListResponse,
     HealthResponse,
     ErrorResponse,
+    UpdateModeRequest,
 )
 from .session_service import get_session_service
-from .runner import get_runner
+from .runner import get_runner, SESSION_STATE_MODE_KEY
+from .search_mode import SearchMode
 
 # Configure logging — use a dedicated named logger with its own file handler
 # so third-party libraries (LiteLLM, ADK) can't override it via root logger.
@@ -418,6 +420,56 @@ async def delete_session(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.patch(
+    "/apps/{app_name}/users/{user_id}/sessions/{session_id}/mode",
+    response_model=SessionInfo,
+    tags=["Sessions"],
+    summary="Set the session-default search mode"
+)
+async def update_session_mode(
+    app_name: str,
+    user_id: str,
+    session_id: str,
+    request: UpdateModeRequest,
+):
+    """
+    Update the session-default search mode.
+
+    Subsequent messages in this session use the new mode unless they specify
+    a per-message `mode` override. Unknown values silently resolve to `auto`
+    (the request is never rejected).
+
+    - **mode**: One of `auto`, `review`, `non_review`.
+    """
+    try:
+        session_service = get_session_service()
+        session = await session_service.get_session(app_name, user_id, session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        resolved = SearchMode.parse(request.mode)
+        new_state = dict(session.state or {})
+        new_state[SESSION_STATE_MODE_KEY] = resolved.value
+        session.state = new_state
+        await session_service.update_session(session)
+
+        msg_count = await session_service.get_message_count(session.id)
+        return SessionInfo(
+            id=session.id,
+            app_name=session.app_name,
+            user_id=session.user_id,
+            state=session.state,
+            created_at=session.created_at,
+            updated_at=session.updated_at,
+            message_count=msg_count,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating session mode: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # -----------------------------------------
 # Chat Endpoints
 # -----------------------------------------
@@ -436,12 +488,14 @@ async def chat(
 ):
     """
     Send a message to the agent and get a complete response.
-    
+
     - **app_name**: Name of the application
     - **user_id**: User identifier
     - **session_id**: Session identifier
     - **message**: The message to send to the agent
-    
+    - **mode**: Optional per-turn search-mode override
+                ('auto' | 'review' | 'non_review'). Overrides session default.
+
     Returns the complete response after the agent finishes processing.
     """
     try:
@@ -450,16 +504,17 @@ async def chat(
         session = await session_service.get_session(app_name, user_id, session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
-        
+
         logger.info(f"Chat request in session {session_id}: {request.message[:100]}...")
-        
+
         # Run agent
         runner = get_runner()
         result = await runner.run(
             app_name=app_name,
             user_id=user_id,
             session_id=session_id,
-            message=request.message
+            message=request.message,
+            mode=request.mode,
         )
         
         logger.info(f"Chat response in session {session_id}: {result.response[:100]}...")
@@ -520,7 +575,8 @@ async def chat_stream(
                 app_name=app_name,
                 user_id=user_id,
                 session_id=session_id,
-                message=request.message
+                message=request.message,
+                mode=request.mode,
             ):
                 yield {
                     "event": "message",
@@ -755,6 +811,14 @@ class StreamRequest(BaseModel):
     messages: Optional[List[Dict]] = Field(default=[], description="List of messages in the conversation")
     max_articles: int = Field(default=30, description="Maximum number of articles to return")
     session_id: Optional[str] = Field(default=None, description="Session ID")
+    mode: Optional[str] = Field(
+        default=None,
+        description=(
+            "Per-request search mode: 'auto' | 'review' | 'non_review'. "
+            "Overrides session default for this turn. Unknown values silently "
+            "fall back to 'auto'."
+        ),
+    )
 
 
 @app.post("/stream", tags=["Chat"])
@@ -826,6 +890,11 @@ async def stream_process(request: StreamRequest):
                 _SENTINEL = object()
                 event_queue = asyncio.Queue()
 
+                # search_mode for the SSE Complete event + transcript. Populated
+                # when runner emits its synthetic ModeContext event up front.
+                search_mode_value = SearchMode.AUTO.value
+                mode_applied_constraints: Dict[str, object] = {"mode": SearchMode.AUTO.value}
+
                 async def _produce_events():
                     """Push agent events into the queue, then signal completion."""
                     try:
@@ -833,7 +902,8 @@ async def stream_process(request: StreamRequest):
                             app_name=app_name,
                             user_id=user_id,
                             session_id=session_id,
-                            message=question
+                            message=question,
+                            mode=request.mode,
                         ):
                             await event_queue.put(ev)
                     except Exception as exc:
@@ -859,6 +929,18 @@ async def stream_process(request: StreamRequest):
                         raise item
 
                     event_dict = item
+
+                    # Synthetic ModeContext event from runner — capture and skip
+                    # the regular event dispatch path. Never user-visible.
+                    if event_dict.get("type") == "ModeContext":
+                        search_mode_value = event_dict.get(
+                            "search_mode", SearchMode.AUTO.value
+                        )
+                        mode_applied_constraints = dict(
+                            event_dict.get("mode_applied_constraints") or {}
+                        )
+                        continue
+
                     # Extract event information
                     agent_name = event_dict.get("agent_name", "")
                     event_type = event_dict.get("type", "")
@@ -1281,6 +1363,8 @@ async def stream_process(request: StreamRequest):
                     "execution_time": round(execution_time, 2),
                     "status": "complete",
                     "n_references": len(pmids),
+                    "search_mode": search_mode_value,
+                    "mode_applied_constraints": mode_applied_constraints,
                     "events": transcript_events,
                 }
                 try:
@@ -1298,6 +1382,8 @@ async def stream_process(request: StreamRequest):
                     'messages': request.messages,
                     'session_id': session_id,
                     'invocation_id': invocation_id,
+                    'search_mode': search_mode_value,
+                    'mode_applied_constraints': mode_applied_constraints,
                     'done': True
                 })
                 
@@ -1321,6 +1407,7 @@ async def stream_process(request: StreamRequest):
                     "execution_time": round(time.time() - step_start_time, 2),
                     "status": "error",
                     "error": error_msg,
+                    "search_mode": search_mode_value,
                     "events": transcript_events,
                 }
                 try:

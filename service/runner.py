@@ -23,8 +23,31 @@ from google.adk.events import Event
 from google.genai.types import Content, Part, UserContent
 
 from .session_service import SQLiteSessionService, Session, get_session_service
+from .search_mode import SearchMode, ModeContext, build_mode_context
 
 logger = logging.getLogger(__name__)
+
+
+# Key in `session.state` where the session-default search mode is stored.
+# Per-message overrides do NOT touch this key; only the PATCH .../mode endpoint does.
+SESSION_STATE_MODE_KEY = "search_mode"
+
+
+def _resolve_mode_context(
+    session: Optional[Session],
+    request_mode: Optional[str],
+) -> ModeContext:
+    """Resolve the effective search mode for this turn.
+
+    Precedence: explicit `request_mode` (per-message override) > session default
+    (`session.state['search_mode']`) > AUTO. Tolerant of unknown values — they
+    silently coerce to AUTO via `SearchMode.parse`.
+    """
+    session_default: Optional[str] = None
+    if session and session.state:
+        session_default = session.state.get(SESSION_STATE_MODE_KEY)
+    effective = SearchMode.parse(request_mode or session_default)
+    return build_mode_context(effective)
 
 
 @dataclass
@@ -236,7 +259,8 @@ class AgentRunner:
         app_name: str,
         user_id: str,
         session_id: str,
-        message: str
+        message: str,
+        mode: Optional[str] = None,
     ) -> RunResult:
         """
         Run the agent with a message and return the complete result.
@@ -246,10 +270,26 @@ class AgentRunner:
             user_id: User identifier
             session_id: Session identifier
             message: User's message
+            mode: Optional per-turn search-mode override
+                  ("auto" | "review" | "non_review"). If None, uses
+                  session.state["search_mode"] (defaults to "auto").
 
         Returns:
             RunResult with response, events, and updated state
         """
+        # Resolve effective mode and prepend its prefix (if non-AUTO) to the
+        # LLM-facing message. The SQLite-stored user message is the original
+        # text — only the LLM sees the prefix.
+        db_session_for_mode = await self.session_service.get_session(
+            app_name, user_id, session_id
+        )
+        mode_ctx = _resolve_mode_context(db_session_for_mode, mode)
+        effective_message = (
+            f"{mode_ctx.user_message_prefix}\n\n{message}"
+            if mode_ctx.user_message_prefix
+            else message
+        )
+
         # Store user message (invocation_id will be updated after run)
         user_msg = await self.session_service.add_message(session_id, "user", message)
 
@@ -268,10 +308,10 @@ class AgentRunner:
         response_parts = []
         invocation_id = None
 
-        # Format message as Content object
+        # Format message as Content object (with mode prefix if non-AUTO)
         user_content = Content(
             role="user",
-            parts=[Part(text=message)]
+            parts=[Part(text=effective_message)]
         )
 
         # Run agent
@@ -331,7 +371,8 @@ class AgentRunner:
         app_name: str,
         user_id: str,
         session_id: str,
-        message: str
+        message: str,
+        mode: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Run the agent with streaming, yielding events as they occur.
@@ -341,10 +382,35 @@ class AgentRunner:
             user_id: User identifier
             session_id: Session identifier
             message: User's message
+            mode: Optional per-turn search-mode override
+                  ("auto" | "review" | "non_review"). If None, uses
+                  session.state["search_mode"] (defaults to "auto").
 
         Yields:
-            Event dictionaries as they occur
+            Event dictionaries as they occur. The first yielded event is a
+            synthetic `ModeContext` event so downstream consumers (e.g. the
+            SSE Complete event builder in api.py) can surface the resolved
+            mode without recomputing it.
         """
+        # Resolve effective mode and prepend its prefix to the LLM-facing message.
+        db_session_for_mode = await self.session_service.get_session(
+            app_name, user_id, session_id
+        )
+        mode_ctx = _resolve_mode_context(db_session_for_mode, mode)
+        effective_message = (
+            f"{mode_ctx.user_message_prefix}\n\n{message}"
+            if mode_ctx.user_message_prefix
+            else message
+        )
+
+        # Emit the resolved mode up front so api.py can capture it for the
+        # SSE Complete payload. This is the only ModeContext event in the stream.
+        yield {
+            "type": "ModeContext",
+            "search_mode": mode_ctx.mode.value,
+            "mode_applied_constraints": mode_ctx.to_constraints_payload(),
+        }
+
         # Store user message (invocation_id will be updated after run)
         user_msg = await self.session_service.add_message(session_id, "user", message)
 
@@ -361,10 +427,10 @@ class AgentRunner:
         response_parts = []
         invocation_id = None
 
-        # Format message as Content object
+        # Format message as Content object (with mode prefix if non-AUTO)
         user_content = Content(
             role="user",
-            parts=[Part(text=message)]
+            parts=[Part(text=effective_message)]
         )
 
         # Run agent and stream events

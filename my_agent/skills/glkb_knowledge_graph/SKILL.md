@@ -34,6 +34,18 @@ Given the user's biomedical question, you must:
 3. If the information is insufficient, you may revise the Cypher queries and execute them no more than 10 times to get more information.
 4. Return a compact summary of the graph evidence.
 
+## Search-mode awareness
+
+If the user message contains a `[search-mode: review]` or `[search-mode: non_review]`
+header, `article_search` accepts a `mode` parameter that injects a Cypher
+WHERE clause filtering on both `Article.pub_type` (NLM tags) and `Article.title`
+(regex). Forward-compatible: pre-migration the pub_type predicate is a no-op
+(coalesces to `[]`) and only the title regex contributes; post-migration both
+work together.
+
+KG relationship queries (genes ↔ diseases, pathways, etc.) are mode-agnostic
+— `pub_type` is irrelevant for those.
+
 ## Workflow for Graph Evidence Retrieval
 
 1. Inspect the schema using `get_database_schema` to understand the available nodes and relationships in the GLKB database.

@@ -16,6 +16,34 @@ When retrieving articles, consider the full conversation context, especially if 
 2. Use the provided tools to retrieve relevant articles from GLKB and PubMed.
 3. Synthesize a summary of literature evidence for the final answer.
 
+## Mode Awareness
+
+The user message may carry a `[search-mode: ...]` header inserted by the
+service runner when the user explicitly selected a mode. Three values are possible:
+
+- `auto` (or no header): no extra filter; behave exactly as before.
+- `review`: the user wants reviews / syntheses / overviews. Pass `mode="review"`
+  to `search_pubmed` and `article_search`. The wrapper expands the query to
+  match BOTH NLM Publication Type tags (`Review`, `Systematic Review`,
+  `Meta-Analysis`) AND title patterns (`review`, `systematic review`,
+  `meta-analysis`, `overview` in Title) — this balances precision (NLM-curated)
+  with recall (catches reviews delayed by NLM's 6–12 month indexing lag).
+  Do NOT pass `article_types` or `exclude_types` — those parameters do not exist.
+- `non_review`: the user wants no reviews. Pass `mode="non_review"`. The wrapper
+  excludes review-related Publication Types AND title patterns at the query side.
+
+For REVIEW mode **quality**: `article_search` is the preferred entry point once
+the GLKB `pub_type` migration has populated `Article.pub_type` — its
+impact-weighted ranking surfaces the highest-citation, highest-IF reviews
+first. Pre-migration, `article_search`'s REVIEW filter falls back to title
+regex only (lower recall), so use `search_pubmed` as the primary REVIEW
+retrieval until migration completes.
+
+If the user's explicit question in the message body conflicts with the mode
+header (e.g. mode=non_review but the user is asking for "reviews on X"),
+follow the user's explicit ask in the message body and briefly note the
+mismatch in your final answer.
+
 ## Tool Selection Strategy
 
 **Primary search — Use `article_search` (GLKB) first:**

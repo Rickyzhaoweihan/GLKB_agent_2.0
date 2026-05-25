@@ -159,3 +159,39 @@ Stored in `my_agent/.env`:
 - ADK SkillToolset is experimental (`@experimental`). Requires `google-adk>=1.25.0`.
 - Named loggers use `propagate=False` to prevent 3rd-party library log hijacking.
 - Neo4j MCP toolset (`/opt/neo4j/neo4j-mcp/neo4j-mcp`) exists as an alternative to direct bolt tools but is not used in the active pipeline.
+
+## Active Design Work
+
+### Search Modes (REVIEW + NON_REVIEW)
+
+The agent supports two opt-in search modes plus an AUTO backward-compat
+fallback:
+
+- `REVIEW`: retrieves review/synthesis literature. PubMed query and GLKB
+  Cypher both expand to match EITHER NLM PublicationType tags (Review,
+  Systematic Review, Meta-Analysis) OR title patterns (`review`, `systematic
+  review`, `meta-analysis`, `overview` in Title) — balanced recall + precision.
+- `NON_REVIEW`: excludes reviews via the symmetric inverse (NOT pub_type AND
+  NOT title).
+- `AUTO`: identical to pre-feature behavior. Used when the HTTP request omits
+  `mode` and the session has no default.
+
+Mode is selected by the user via HTTP:
+
+- Per-request: `mode` field on `POST /stream`, `POST .../chat`, `POST .../chat/stream`.
+- Session default: `PATCH .../mode` (persisted to `session.state["search_mode"]`).
+
+The `service/runner.py` resolution helper prefers per-request → session default
+→ AUTO and prepends a `[search-mode: ...]` header to the LLM-facing message so
+the skill can route accordingly. All filter logic is in the tool wrappers
+(`my_agent/tools.py`) — agent only passes `mode="review"` or
+`mode="non_review"` verbatim.
+
+**Parallel workstream**: `scripts/migrate_pub_types/` populates
+`Article.pub_type` in GLKB Neo4j from NLM Annual Baseline XML files. The agent
+feature ships without blocking on migration via forward-compatible
+`coalesce(a.pub_type, [])` Cypher. After migration, `article_search` REVIEW
+mode benefits from native pub_type matching + the existing impact-weighted
+ranking.
+
+**Design doc**: @docs/plans/2026-05-22-search-mode-design.md

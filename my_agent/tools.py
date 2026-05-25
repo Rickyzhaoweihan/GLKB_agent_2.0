@@ -14,6 +14,7 @@ import httpx
 import logging
 import os
 import re
+import sys
 import functools
 import json
 from typing import Literal, Optional, List
@@ -22,10 +23,79 @@ from dotenv import load_dotenv
 from google.adk.tools import FunctionTool
 from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioServerParameters, StdioConnectionParams
 from neo4j import GraphDatabase, READ_ACCESS
+
+# Make the project root importable so `service.search_mode` is reachable
+# regardless of whether the agent is launched via `adk run` (cwd=my_agent/)
+# or via the FastAPI service (cwd=project root).
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from service.search_mode import SearchMode  # noqa: E402
+
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 # Use the shared agent logger (propagate=False, immune to root-logger reconfig)
 logger = logging.getLogger("glkb_agent_service")
+
+# -----------------------------------------
+# Search-mode query fragments.
+#
+# REVIEW mode expands the query to match EITHER an NLM PublicationType tag OR
+# a title-based heuristic — balances precision (NLM tags) with recall
+# (title catches reviews that NLM hasn't indexed yet, 6-12 month lag).
+#
+# NON_REVIEW mode restricts the query to NOT match either signal.
+# See docs/plans/2026-05-22-search-mode-design.md.
+# -----------------------------------------
+
+_REVIEW_PUBMED_CLAUSE = (
+    '("Review"[Publication Type] OR "Systematic Review"[Publication Type] OR '
+    '"Meta-Analysis"[Publication Type] OR review[Title] OR '
+    '"systematic review"[Title] OR "meta-analysis"[Title] OR overview[Title])'
+)
+
+_NON_REVIEW_PUBMED_CLAUSE = (
+    'NOT "Review"[Publication Type] NOT "Systematic Review"[Publication Type] '
+    'NOT "Meta-Analysis"[Publication Type] NOT review[Title] '
+    'NOT "systematic review"[Title] NOT "meta-analysis"[Title]'
+)
+
+# Cypher fragments are inserted as WHERE clauses in article_search. Note the
+# four-backslash escaping: Python string → Cypher source → Cypher regex.
+_REVIEW_CYPHER_WHERE = (
+    "WHERE any(t IN coalesce(a.pub_type, []) WHERE t IN "
+    "['Review','Systematic Review','Meta-Analysis']) "
+    "OR a.title =~ '(?i).*\\\\b(review|systematic\\\\s+review|"
+    "meta.?analys[ie]s|overview)\\\\b.*'"
+)
+
+_NON_REVIEW_CYPHER_WHERE = (
+    "WHERE NOT any(t IN coalesce(a.pub_type, []) WHERE t IN "
+    "['Review','Systematic Review','Meta-Analysis']) "
+    "AND NOT (a.title =~ '(?i).*\\\\b(review|systematic\\\\s+review|"
+    "meta.?analys[ie]s|overview)\\\\b.*')"
+)
+
+
+def _mode_pubmed_clause(mode: Optional[str]) -> str:
+    """Return the PubMed query fragment for the given mode, or empty string."""
+    m = SearchMode.parse(mode)
+    if m == SearchMode.REVIEW:
+        return f"AND {_REVIEW_PUBMED_CLAUSE}"
+    if m == SearchMode.NON_REVIEW:
+        return _NON_REVIEW_PUBMED_CLAUSE
+    return ""
+
+
+def _mode_cypher_where(mode: Optional[str]) -> str:
+    """Return the Cypher WHERE fragment for the given mode, or empty string."""
+    m = SearchMode.parse(mode)
+    if m == SearchMode.REVIEW:
+        return _REVIEW_CYPHER_WHERE
+    if m == SearchMode.NON_REVIEW:
+        return _NON_REVIEW_CYPHER_WHERE
+    return ""
 
 # -----------------------------------------
 # Logging Decorator for Tools
@@ -170,16 +240,23 @@ async def article_search(
     keywords: Optional[List[str]] = None,
     pubmed_ids: Optional[List[str]] = None,
     limit: int = 20,
-    prioritize_recent: bool = False
+    prioritize_recent: bool = False,
+    mode: Optional[str] = None,
 ) -> dict:
     """
     Search for PubMed articles in the GLKB Neo4j knowledge graph using keywords or PubMed IDs.
-    
+
     Args:
         keywords: a list of key words to search for
         pubmed_ids: a list of PubMed IDs to search for
-        limit: Maximum number of results to return (default: 10)
+        limit: Maximum number of results to return (default: 20)
         prioritize_recent: Whether to prioritize recent articles or to prioritize impactful articles. If True, recent articles will be prioritized. If False, impactful articles will be prioritized. Default is False.
+        mode: One of "review" | "non_review" | None. When set, the wrapper
+              injects a Cypher WHERE clause that matches (REVIEW) or excludes
+              (NON_REVIEW) review-related articles. The filter combines NLM
+              PublicationType tags with title regex for recall+precision
+              balance. Forward-compatible with the pre-migration GLKB state
+              where Article.pub_type is unpopulated (coalesces to []).
     Returns:
         dict: Contains search results or error information
             - success: bool indicating if search was successful
@@ -187,6 +264,9 @@ async def article_search(
             - results: list of matching articles with their properties
             - error: error message (if unsuccessful)
     """
+    # Pick the WHERE fragment for this mode (empty string if AUTO/None).
+    mode_where = _mode_cypher_where(mode)
+
     try:
         if keywords and pubmed_ids:
             return {
@@ -195,7 +275,7 @@ async def article_search(
             }
         if keywords:
             if prioritize_recent:
-                order_by = """ORDER BY 
+                order_by = """ORDER BY
     log(1 + 5 * score) +
     log(1 + a.n_citation) * exp(-0.05 * (date().year - a.pubdate)) +
     (0.5 * j.impact_factor) * exp(-0.20 * (date().year - a.pubdate)) +
@@ -203,12 +283,14 @@ async def article_search(
 DESC"""
             else:
                 order_by = "order by log(1+5*score) + log(1+a.n_citation) + 0.5*j.impact_factor*exp(-0.15*date().year-a.pubdate) desc"
-            # Build the Cypher query
+            # Build the Cypher query. The mode WHERE is inserted after the
+            # fulltext-index LIMIT 100 so it doesn't fight the index.
             query = f"""
             CALL db.index.fulltext.queryNodes("article_Title", $keywords) YIELD node, score WITH node as a, score LIMIT 100
             WITH a, score
+            {mode_where}
             MATCH (a)-[:PublishedIn]->(j:Journal)
-            RETURN a.pubmedid as pubmedid, a.n_citation as n_citation, a.pubdate as pubdate, a.title as title, a.abstract as abstract, a.journal as journal, a.authors as authors, score as score
+            RETURN a.pubmedid as pubmedid, a.n_citation as n_citation, a.pubdate as pubdate, a.title as title, a.abstract as abstract, a.journal as journal, a.authors as authors, coalesce(a.pub_type, []) as pub_type, score as score
             {order_by} LIMIT $limit
             """
             params = {"keywords": ' '.join(keywords), "limit": limit}
@@ -220,9 +302,14 @@ DESC"""
                 "results": results
             }
         elif pubmed_ids:
-            # Build the Cypher query
+            # For the pubmed_ids branch, AND the mode predicate onto the
+            # existing WHERE. The mode_where string starts with "WHERE ..." so
+            # strip the leading keyword when chaining.
+            mode_clause = mode_where.replace("WHERE ", "", 1) if mode_where else ""
+            extra_and = f"AND ({mode_clause})" if mode_clause else ""
             query = f"""
-            MATCH (a:Article) WHERE a.pubmedid IN $pubmed_ids RETURN a.pubmedid as pubmedid, a.n_citation as n_citation, a.pubdate as pubdate, a.title as title, a.abstract as abstract, a.journal as journal, a.authors as authors
+            MATCH (a:Article) WHERE a.pubmedid IN $pubmed_ids {extra_and}
+            RETURN a.pubmedid as pubmedid, a.n_citation as n_citation, a.pubdate as pubdate, a.title as title, a.abstract as abstract, a.journal as journal, a.authors as authors, coalesce(a.pub_type, []) as pub_type
             """
             params = {"pubmed_ids": pubmed_ids}
             results = run_cypher_query(query, params)
@@ -498,6 +585,7 @@ async def search_pubmed(
     min_date: Optional[str] = None,
     max_date: Optional[str] = None,
     sort: str = "relevance",
+    mode: Optional[str] = None,
 ) -> dict:
     """
     Search PubMed directly via NCBI E-utilities for articles matching a query.
@@ -511,10 +599,19 @@ async def search_pubmed(
         min_date: Minimum publication date (YYYY/MM/DD), e.g. "2023/01/01"
         max_date: Maximum publication date (YYYY/MM/DD), e.g. "2024/12/31"
         sort: Sort order - "relevance" (default) or "pub+date" (newest first)
+        mode: One of "review" | "non_review" | None. When set, the wrapper
+              expands (REVIEW) or restricts (NON_REVIEW) the PubMed query to
+              match review-related Publication Type tags OR title patterns.
+              None (default) is the AUTO behavior — no filter.
 
     Returns:
         dict with keys: success, count, pmids, articles (list of summaries), query_info, error
     """
+    mode_clause = _mode_pubmed_clause(mode)
+    if mode_clause:
+        # Wrap the original query in parens so the user-side query stays grouped,
+        # then append the mode clause (AND ... for REVIEW, NOT ... for NON_REVIEW).
+        query = f"({query}) {mode_clause}"
     return await asyncio.to_thread(
         _search_pubmed,
         query=query,

@@ -29,6 +29,21 @@ class ChatRequest(BaseModel):
         ...,
         description="The user's message to send to the agent."
     )
+    mode: Optional[str] = Field(
+        default=None,
+        description=(
+            "Search-mode override for this turn only: 'auto' | 'review' | 'non_review'. "
+            "If omitted, falls back to the session default (which itself defaults to 'auto')."
+        ),
+    )
+
+
+class UpdateModeRequest(BaseModel):
+    """Request body for setting the session-default search mode."""
+    mode: str = Field(
+        ...,
+        description="Session-default search mode: 'auto' | 'review' | 'non_review'.",
+    )
 
 
 class RewindRequest(BaseModel):
