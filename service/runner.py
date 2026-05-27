@@ -23,8 +23,29 @@ from google.adk.events import Event
 from google.genai.types import Content, Part, UserContent
 
 from .session_service import SQLiteSessionService, Session, get_session_service
+from my_agent.ranking_mode import (
+    RankingContext,
+    RankingMode,
+    build_ranking_context,
+)
 
 logger = logging.getLogger(__name__)
+
+
+SESSION_STATE_RANKING_MODE_KEY = "ranking_mode"
+
+
+def _resolve_ranking_context(
+    session: Optional[Session],
+    request_ranking_mode: Optional[str],
+) -> RankingContext:
+    """Pick the effective ranking mode for this turn."""
+    session_default = None
+    if session and session.state:
+        session_default = session.state.get(SESSION_STATE_RANKING_MODE_KEY)
+
+    effective = RankingMode.parse(request_ranking_mode or session_default)
+    return build_ranking_context(effective)
 
 
 @dataclass
@@ -236,7 +257,8 @@ class AgentRunner:
         app_name: str,
         user_id: str,
         session_id: str,
-        message: str
+        message: str,
+        ranking_mode: Optional[str] = None,
     ) -> RunResult:
         """
         Run the agent with a message and return the complete result.
@@ -246,10 +268,25 @@ class AgentRunner:
             user_id: User identifier
             session_id: Session identifier
             message: User's message
+            ranking_mode: Optional per-turn ranking override
+                  ("default" | "high_impact" | "recent").
 
         Returns:
             RunResult with response, events, and updated state
         """
+        db_session_for_ranking = await self.session_service.get_session(
+            app_name, user_id, session_id
+        )
+        ranking_ctx = _resolve_ranking_context(
+            db_session_for_ranking,
+            ranking_mode,
+        )
+        effective_message = (
+            f"{ranking_ctx.user_message_prefix}\n\n{message}"
+            if ranking_ctx.user_message_prefix
+            else message
+        )
+
         # Store user message (invocation_id will be updated after run)
         user_msg = await self.session_service.add_message(session_id, "user", message)
 
@@ -264,14 +301,18 @@ class AgentRunner:
         )
 
         # Collect events and response
-        events = []
+        events = [{
+            "type": "RankingContext",
+            "ranking_mode": ranking_ctx.ranking_mode.value,
+            "ranking_applied": ranking_ctx.to_payload(),
+        }]
         response_parts = []
         invocation_id = None
 
-        # Format message as Content object
+        # Format message as Content object (with ranking prefix if non-default)
         user_content = Content(
             role="user",
-            parts=[Part(text=message)]
+            parts=[Part(text=effective_message)]
         )
 
         # Run agent
@@ -331,7 +372,8 @@ class AgentRunner:
         app_name: str,
         user_id: str,
         session_id: str,
-        message: str
+        message: str,
+        ranking_mode: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Run the agent with streaming, yielding events as they occur.
@@ -341,10 +383,31 @@ class AgentRunner:
             user_id: User identifier
             session_id: Session identifier
             message: User's message
+            ranking_mode: Optional per-turn ranking override
+                  ("default" | "high_impact" | "recent").
 
         Yields:
             Event dictionaries as they occur
         """
+        db_session_for_ranking = await self.session_service.get_session(
+            app_name, user_id, session_id
+        )
+        ranking_ctx = _resolve_ranking_context(
+            db_session_for_ranking,
+            ranking_mode,
+        )
+        effective_message = (
+            f"{ranking_ctx.user_message_prefix}\n\n{message}"
+            if ranking_ctx.user_message_prefix
+            else message
+        )
+
+        yield {
+            "type": "RankingContext",
+            "ranking_mode": ranking_ctx.ranking_mode.value,
+            "ranking_applied": ranking_ctx.to_payload(),
+        }
+
         # Store user message (invocation_id will be updated after run)
         user_msg = await self.session_service.add_message(session_id, "user", message)
 
@@ -361,10 +424,10 @@ class AgentRunner:
         response_parts = []
         invocation_id = None
 
-        # Format message as Content object
+        # Format message as Content object (with ranking prefix if non-default)
         user_content = Content(
             role="user",
-            parts=[Part(text=message)]
+            parts=[Part(text=effective_message)]
         )
 
         # Run agent and stream events
@@ -498,4 +561,3 @@ def get_runner() -> AgentRunner:
         from my_agent.agent import root_agent
         _runner = AgentRunner(agent=root_agent)
     return _runner
-

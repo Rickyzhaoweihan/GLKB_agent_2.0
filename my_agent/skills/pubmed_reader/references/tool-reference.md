@@ -4,15 +4,15 @@
 
 Searches the GLKB Neo4j knowledge graph full-text index for articles.
 
-**Args**: `keywords` (list of strings), `pubmed_ids` (list of PMIDs), `limit` (default 20), `prioritize_recent` (bool, default False), `mode` ("none" or "high_impact", default "none")
+**Args**: `keywords` (list of strings), `pubmed_ids` (list of PMIDs), `limit` (default 20), `prioritize_recent` (bool, default False), `ranking_mode` ("default", "high_impact", or "recent")
 
 **Returns**: `success`, `count`, `results` (list with pubmedid, title, abstract, journal, authors, n_citation, pubdate, score)
 
 **Notes**:
 - Only one of `keywords` or `pubmed_ids` should be provided
 - Has pre-computed impact scores and journal impact factors
-- Two scoring modes: impact-prioritized (default) and recent-prioritized
-- Use `mode="high_impact"` for explicit high-impact paper search
+- Ranking modes: impact-prioritized default, explicit high-impact, and recent-prioritized
+- Use `ranking_mode="high_impact"` for explicit high-impact paper search
 
 ## search_pubmed (NCBI)
 

@@ -27,7 +27,7 @@ import re
 import time
 import uuid
 from datetime import datetime
-from typing import Optional, Literal
+from typing import Optional
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request, status
@@ -459,7 +459,8 @@ async def chat(
             app_name=app_name,
             user_id=user_id,
             session_id=session_id,
-            message=request.message
+            message=request.message,
+            ranking_mode=request.ranking_mode,
         )
         
         logger.info(f"Chat response in session {session_id}: {result.response[:100]}...")
@@ -520,7 +521,8 @@ async def chat_stream(
                 app_name=app_name,
                 user_id=user_id,
                 session_id=session_id,
-                message=request.message
+                message=request.message,
+                ranking_mode=request.ranking_mode,
             ):
                 yield {
                     "event": "message",
@@ -752,7 +754,10 @@ def _build_trajectory(events: list) -> list:
 class StreamRequest(BaseModel):
     """Request body for the /stream endpoint."""
     question: str = Field(..., description="The user's question")
-    mode: Optional[Literal["none", "high_impact"]] = Field(default="none", description="Optional mode: none or high_impact")
+    ranking_mode: Optional[str] = Field(
+        default=None,
+        description="Ranking strategy: 'default', 'high_impact', or 'recent'.",
+    )
     messages: Optional[List[Dict]] = Field(default=[], description="List of messages in the conversation")
     max_articles: int = Field(default=30, description="Maximum number of articles to return")
     session_id: Optional[str] = Field(default=None, description="Session ID")
@@ -773,13 +778,6 @@ async def stream_process(request: StreamRequest):
     """
     try:
         question = request.question
-        if request.mode == "high_impact":
-            question = (
-                "Mode: high_impact. Prioritize high-impact biomedical papers. "
-                "Use GLKB article_search with mode='high_impact' first. "
-                "Rank papers by title relevance, citation count, and journal impact factor before using broader PubMed search.\n\n"
-                f"User question: {question}"
-            )
         step_start_time = time.time()
         logger.info(f"[STREAM REQUEST] question={question!r} session_id={request.session_id}")
 
@@ -804,7 +802,12 @@ async def stream_process(request: StreamRequest):
             # Helper function to format SSE messages
             def send_message(data):
                 return f"data: {json.dumps(data)}\n\n"
-            
+
+            transcript_events = []  # per-request event log for transcript
+            ranking_mode_value = "default"
+            ranking_applied = {"ranking_mode": ranking_mode_value}
+            producer_task = None
+
             try:
                 runner = get_runner()
                 response_parts = []
@@ -812,7 +815,6 @@ async def stream_process(request: StreamRequest):
                 invocation_id = None
                 evidence_map = {}  # pmid -> list of {quote, context_type}
                 trajectory_events = []  # raw tool calls for trajectory builder
-                transcript_events = []  # per-request event log for transcript
 
                 # Map agent names to step names
                 agent_step_map = {
@@ -841,7 +843,8 @@ async def stream_process(request: StreamRequest):
                             app_name=app_name,
                             user_id=user_id,
                             session_id=session_id,
-                            message=question
+                            message=question,
+                            ranking_mode=request.ranking_mode,
                         ):
                             await event_queue.put(ev)
                     except Exception as exc:
@@ -867,6 +870,11 @@ async def stream_process(request: StreamRequest):
                         raise item
 
                     event_dict = item
+                    if event_dict.get("type") == "RankingContext":
+                        ranking_mode_value = event_dict.get("ranking_mode", "default")
+                        ranking_applied = dict(event_dict.get("ranking_applied") or {})
+                        continue
+
                     # Extract event information
                     agent_name = event_dict.get("agent_name", "")
                     event_type = event_dict.get("type", "")
@@ -1288,6 +1296,8 @@ async def stream_process(request: StreamRequest):
                     "question": question,
                     "execution_time": round(execution_time, 2),
                     "status": "complete",
+                    "ranking_mode": ranking_mode_value,
+                    "ranking_applied": ranking_applied,
                     "n_references": len(pmids),
                     "events": transcript_events,
                 }
@@ -1306,6 +1316,8 @@ async def stream_process(request: StreamRequest):
                     'messages': request.messages,
                     'session_id': session_id,
                     'invocation_id': invocation_id,
+                    'ranking_mode': ranking_mode_value,
+                    'ranking_applied': ranking_applied,
                     'done': True
                 })
                 
@@ -1328,6 +1340,8 @@ async def stream_process(request: StreamRequest):
                     "question": question,
                     "execution_time": round(time.time() - step_start_time, 2),
                     "status": "error",
+                    "ranking_mode": ranking_mode_value,
+                    "ranking_applied": ranking_applied,
                     "error": error_msg,
                     "events": transcript_events,
                 }
@@ -1343,15 +1357,12 @@ async def stream_process(request: StreamRequest):
                 })
             finally:
                 # Ensure the producer task is cleaned up
-                try:
-                    if not producer_task.done():
-                        producer_task.cancel()
-                        try:
-                            await producer_task
-                        except (asyncio.CancelledError, Exception):
-                            pass
-                except NameError:
-                    pass
+                if producer_task and not producer_task.done():
+                    producer_task.cancel()
+                    try:
+                        await producer_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
         
         # Return streaming response
         return StreamingResponse(

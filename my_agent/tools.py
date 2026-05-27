@@ -16,12 +16,18 @@ import os
 import re
 import functools
 import json
-from typing import Literal, Optional, List
+from typing import Optional, List
 
 from dotenv import load_dotenv
 from google.adk.tools import FunctionTool
 from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioServerParameters, StdioConnectionParams
 from neo4j import GraphDatabase, READ_ACCESS
+
+try:
+    from ranking_mode import RankingMode
+except ImportError:
+    from my_agent.ranking_mode import RankingMode
+
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 # Use the shared agent logger (propagate=False, immune to root-logger reconfig)
@@ -67,14 +73,17 @@ CYPHER_MAX_ROWS = 500      # hard cap on returned rows
 CYPHER_DEFAULT_LIMIT = 50  # injected when query has no LIMIT clause
 
 def _article_search_order_by(
+    ranking_mode: RankingMode,
     prioritize_recent: bool = False,
-    mode: str = "none",
 ) -> str:
     """Build article search ordering for impact-first or recent-first results."""
-    impact_order = "order by log(1+5*score) + log(1+a.n_citation) + 0.5*j.impact_factor*exp(-0.15*date().year-a.pubdate) desc"
-    if mode == "high_impact":
+    impact_order = (
+        "ORDER BY log(1 + 5 * score) + log(1 + a.n_citation) + "
+        "0.5 * j.impact_factor * exp(-0.15 * (date().year - a.pubdate)) DESC"
+    )
+    if ranking_mode == RankingMode.HIGH_IMPACT:
         return impact_order
-    if prioritize_recent:
+    if ranking_mode == RankingMode.RECENT or prioritize_recent:
         return """ORDER BY 
     log(1 + 5 * score) +
     log(1 + a.n_citation) * exp(-0.05 * (date().year - a.pubdate)) +
@@ -188,7 +197,7 @@ async def article_search(
     pubmed_ids: Optional[List[str]] = None,
     limit: int = 20,
     prioritize_recent: bool = False,
-    mode: str = "none",
+    ranking_mode: Optional[str] = None,
 ) -> dict:
     """
     Search for PubMed articles in the GLKB Neo4j knowledge graph using keywords or PubMed IDs.
@@ -198,7 +207,7 @@ async def article_search(
         pubmed_ids: a list of PubMed IDs to search for
         limit: Maximum number of results to return (default: 10)
         prioritize_recent: Whether to prioritize recent articles or to prioritize impactful articles. If True, recent articles will be prioritized. If False, impactful articles will be prioritized. Default is False.
-        mode: Optional search mode. Use "high_impact" to explicitly prioritize high-impact papers. Default is "none".
+        ranking_mode: Ranking strategy. Use "high_impact" to prioritize impactful papers or "recent" to favor newer papers. Default is "default".
     Returns:
         dict: Contains search results or error information
             - success: bool indicating if search was successful
@@ -206,14 +215,16 @@ async def article_search(
             - results: list of matching articles with their properties
             - error: error message (if unsuccessful)
     """
+    ranking_mode_value = RankingMode.parse(ranking_mode)
     try:
         if keywords and pubmed_ids:
             return {
                 "success": False,
+                "ranking_mode": ranking_mode_value.value,
                 "error": "Both keywords and PubMed IDs provided, please provide only one"
             }
         if keywords:
-            order_by = _article_search_order_by(prioritize_recent, mode)
+            order_by = _article_search_order_by(ranking_mode_value, prioritize_recent)
             # Build the Cypher query
             query = f"""
             CALL db.index.fulltext.queryNodes("article_Title", $keywords) YIELD node, score WITH node as a, score LIMIT 100
@@ -227,7 +238,7 @@ async def article_search(
             return {
                 "success": True,
                 "keywords": keywords,
-                "mode": mode,
+                "ranking_mode": ranking_mode_value.value,
                 "count": len(results),
                 "results": results
             }
@@ -241,18 +252,21 @@ async def article_search(
             return {
                 "success": True,
                 "pubmed_ids": pubmed_ids,
+                "ranking_mode": ranking_mode_value.value,
                 "count": len(results),
                 "results": results
             }
         else:
             return {
                 "success": False,
+                "ranking_mode": ranking_mode_value.value,
                 "error": "No keywords or PubMed IDs provided"
             }
     except Exception as e:
         return {
             "success": False,
             "keywords": keywords,
+            "ranking_mode": ranking_mode_value.value,
             "error": f"Failed to search articles: {str(e)}"
         }
 

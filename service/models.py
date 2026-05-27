@@ -29,6 +29,10 @@ class ChatRequest(BaseModel):
         ...,
         description="The user's message to send to the agent."
     )
+    ranking_mode: Optional[str] = Field(
+        default=None,
+        description="Ranking strategy for this turn: 'default' | 'high_impact' | 'recent'.",
+    )
 
 
 class RewindRequest(BaseModel):
@@ -114,4 +118,3 @@ class ErrorResponse(BaseModel):
     """Error response."""
     error: str
     detail: Optional[str] = None
-
