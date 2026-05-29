@@ -1,6 +1,16 @@
-# Environment and secrets
+# Environment and secrets — NEVER commit credentials
 .env
+.env.*
+**/.env
 my_agent/.env
+.openai_key
+.neo4j_password
+*.key
+*_key
+*_token
+*secret*
+*credential*
+*.pem
 
 # Python
 __pycache__/
