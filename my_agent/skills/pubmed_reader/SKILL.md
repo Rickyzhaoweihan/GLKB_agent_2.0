@@ -39,6 +39,23 @@ first. Pre-migration, `article_search`'s REVIEW filter falls back to title
 regex only (lower recall), so use `search_pubmed` as the primary REVIEW
 retrieval until migration completes.
 
+### Abstract check before citing (REVIEW / NON_REVIEW)
+
+The query-side filter (pub_type tag + title regex) is the only automatic filter,
+and it can miss reviews that NLM has not yet tagged and whose title lacks an
+obvious "review/overview/meta-analysis" cue (the ~46% "Journal Article"-only
+bucket). You already read title + abstract before citing, so use that reading as
+a final check — no extra tool call needed:
+
+- In **NON_REVIEW** mode: do NOT cite an article whose abstract clearly reads as
+  a review/synthesis (summarises existing literature, narrates the state of a
+  field, no original methods or data).
+- In **REVIEW** mode: do NOT cite an article whose abstract clearly describes a
+  single primary study (original experiment/data) despite being retrieved.
+
+When you drop an article this way, briefly note it in your answer so the user
+knows the filter was applied beyond the automatic query.
+
 If the user's explicit question in the message body conflicts with the mode
 header (e.g. mode=non_review but the user is asking for "reviews on X"),
 follow the user's explicit ask in the message body and briefly note the
